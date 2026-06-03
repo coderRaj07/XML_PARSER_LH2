@@ -1,4 +1,7 @@
+import gzip
 import logging
+
+import trafilatura
 
 from src.application.interfaces.fetcher import Fetcher
 from src.application.interfaces.repositories import JobRepository, RecordRepository, TaskRepository
@@ -36,6 +39,7 @@ class TaskProcessor:
         try:
             raw_xml = await self._fetch(task)
             records = await self._parse(task, raw_xml)
+            await self._fetch_full_contents(records)
             await self._store_records(task, records)
             await self._summarize(records)
             task.mark_completed()
@@ -60,6 +64,19 @@ class TaskProcessor:
             r.task_id = task.id
         return records
 
+    async def _fetch_full_contents(self, records: list[Record]) -> None:
+        for record in records:
+            if not record.source_link:
+                continue
+            try:
+                html = await self._fetcher.fetch(record.source_link)
+                extracted = trafilatura.extract(html)
+                if extracted:
+                    record.full_content = gzip.compress(extracted.encode("utf-8"))
+                    record.content = extracted
+            except Exception:
+                logger.warning("full_content_fetch_failed", extra={"record_id": record.id, "url": record.source_link})
+
     async def _store_records(self, task: Task, records: list[Record]) -> None:
         if records:
             await self._record_repository.create_many(records)
@@ -68,7 +85,8 @@ class TaskProcessor:
     async def _summarize(self, records: list[Record]) -> None:
         for record in records:
             logger.info("summary_started", extra={"record_id": record.id})
-            summary_text = self._summary_service.generate_summary(record.content)
+            source_text = record.content or record.description or record.title
+            summary_text = self._summary_service.generate_summary(source_text)
             summary = Summary(
                 record_id=record.id,
                 summary_text=summary_text,
