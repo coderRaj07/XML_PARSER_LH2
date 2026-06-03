@@ -145,10 +145,31 @@ Tested at **101 URLs**: **97 completed, 4 permanently failed** (~2 min initial +
 
 | Run | URLs | Completed | Failed | Notes |
 |-----|------|-----------|--------|-------|
-| Initial | 101 | 50 | 50+1 | Pre-fixes baseline |
-| Retry 1 (UA + throttle fix) | 51 | 35 | 16 | complex.com, cinemablend, etc. fixed |
-| Retry 2 (Sec-Fetch + 5xx body) | 14 YouTube | 12 | 2 | YouTube channel with valid XML fixed |
-| **Total unique** | **101** | **97** | **4** | tripwire, sony, 2 dead YouTube channels |
+| Initial (pre-fixes) | 101 | 50 | 51 | Baseline before any fixes |
+| Retry 1 (UA + throttle fix) | 51 | 35 | 16 | fixed: complex.com 403, cinemablend pending, CancelledError crashes |
+| Retry 2 (Sec-Fetch + 5xx body) | 14 YouTube | 12 | 2 | fixed: YouTube 500s with valid XML body |
+| **Total unique** | **101** | **97** | **4** | see failure analysis below |
+
+### Failure Analysis (34 failures in the original run → 4 permanent after all fixes)
+
+| Category | Count | Root Cause | Verdict |
+|----------|-------|------------|---------|
+| YouTube 404 (invalid channel ID) | ~30 | Channel deleted or never existed. YouTube returns HTTP 404 with error page. | **Permanent** — no fix possible |
+| YouTube 500 with valid XML body | ~8 | YouTube internal error, but response body contains the valid RSS feed XML | **Fixed** — now return body regardless of status code |
+| YouTube 500 missing Sec-Fetch headers | ~4 | YouTube requires `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, etc. modern browser security headers | **Fixed** — added all Sec-Fetch-* headers |
+| tripwire.com 403 (Cloudflare WAF) | 1 | Cloudflare WAF blocks non-browser traffic. Beyond simple UA spoofing. | **Permanent** — would need headless browser or proxy rotation |
+| sony.com 403 (Cloudflare WAF) | 1 | Same as above — Cloudflare-level blocking | **Permanent** — same limitation |
+
+#### Why 32 YouTube channels are permanently dead
+YouTube RSS feeds for non-existent or deleted channels return HTTP 404 with an error page. These channel IDs likely belong to:
+- Channels that were deleted or renamed by the owner
+- Typo'd or invalid channel IDs from the original URL list
+- Channels that never existed (random/placeholder IDs)
+
+The fetcher treats 404 as a permanent error and does not retry.
+
+#### Why tripwire.com and sony.com are permanently blocked
+Both sites use Cloudflare's WAF (Web Application Firewall), which inspects TLS fingerprints, JavaScript execution capability, and browser integrity — not just headers. A simple HTTP client cannot bypass this regardless of User-Agent or headers. Solutions would require headless browser rendering or residential proxy rotation, which are out of scope.
 
 #### 10× Scale — 1,000 URLs
 
