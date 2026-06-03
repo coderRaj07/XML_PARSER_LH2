@@ -37,6 +37,21 @@ curl http://localhost:8000/jobs/{job_id}
 curl "http://localhost:8000/jobs/{job_id}/records?limit=5"
 ```
 
+### Run with multiple workers (faster)
+
+```bash
+# Scale to 5 workers after services are up
+docker compose up -d --scale worker=5
+
+# Verify all workers are running
+docker compose ps worker
+
+# Monitor all worker logs
+docker compose logs -f worker
+
+# Expected improvement: ~10 min → ~2-3 min for 101 URLs
+```
+
 ### Run locally
 
 ```bash
@@ -355,3 +370,4 @@ Copy this into Swagger UI at `http://localhost:8000/docs`:
 |----------|-------------|
 | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture diagrams, concurrency model, design decisions, scaling analysis, tradeoffs |
 | [`FIXES.md`](docs/FIXES.md) | Complete log of all 11 issues faced during development and how they were resolved |
+| [`PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md) | Q&A on performance bottlenecks, retry behavior, scaling, and expected improvements |

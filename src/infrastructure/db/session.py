@@ -13,7 +13,7 @@ class DatabaseSessionManager:
     @classmethod
     def initialize(cls, database_url: str) -> None:
         cls._database_url = database_url
-        engine = create_async_engine(database_url, pool_size=10, max_overflow=20, echo=False)
+        engine = create_async_engine(database_url, pool_size=30, max_overflow=60, echo=False)
         cls._engine = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
     @classmethod

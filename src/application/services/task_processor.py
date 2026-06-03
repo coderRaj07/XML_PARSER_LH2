@@ -46,7 +46,7 @@ class TaskProcessor:
         task_repository: TaskRepository,
         record_repository: RecordRepository,
         job_repository: JobRepository,
-        max_articles: int = 20,
+        max_articles: int = 10,
     ) -> None:
         self._fetcher = fetcher
         self._parser = parser
@@ -77,19 +77,26 @@ class TaskProcessor:
             await self._summarize(records)
             task.mark_completed()
             logger.info("task_completed", extra={"task_id": task.id, "url": task.url})
+            await self._task_repository.update(task)
+            await self._update_job_progress(task)
+            return task
         except CancelledError:
             task.mark_failed("Activity cancelled")
             logger.info("task_cancelled", extra={"task_id": task.id, "url": task.url})
-            await self._task_repository.rollback()
+            raise
+        except RuntimeError as e:
+            if "Permanent failure" in str(e):
+                task.mark_failed(str(e))
+                logger.error("task_failed", extra={"task_id": task.id, "url": task.url, "error": str(e)})
+                await self._task_repository.rollback()
+                await self._task_repository.update(task)
+                await self._update_job_progress(task)
+                return task
             raise
         except Exception as e:
             task.mark_failed(str(e))
             logger.error("task_failed", extra={"task_id": task.id, "url": task.url, "error": str(e)})
-            await self._task_repository.rollback()
-
-        await self._task_repository.update(task)
-        await self._update_job_progress(task)
-        return task
+            raise
 
     async def _fetch(self, task: Task) -> str:
         logger.info("fetch_started", extra={"task_id": task.id, "url": task.url})

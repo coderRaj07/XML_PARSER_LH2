@@ -62,6 +62,10 @@ services:
       temporal:
         condition: service_started
 
+  # Scale workers for more throughput:
+  #   docker compose up -d --scale worker=5
+  # Each worker processes activities concurrently from the same task queue.
+  # Effective parallelism is limited by DB pool_size (30) × worker count.
   worker:
     build: .
     command: python -m src.infrastructure.temporal.run_worker

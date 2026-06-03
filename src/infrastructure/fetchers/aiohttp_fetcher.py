@@ -43,10 +43,12 @@ class AioHttpFetcher(Fetcher):
         )
 
     async def fetch(self, url: str) -> str:
+        request_timeout = aiohttp.ClientTimeout(total=10) if "youtube.com/feeds/videos.xml" in url else self._timeout
+
         last_exception: Exception | None = None
         for attempt in range(self._max_retries):
             try:
-                async with self._session.get(url) as response:
+                async with self._session.get(url, timeout=request_timeout) as response:
                     text = await response.text()
                     if response.status in _PERMANENT_STATUSES:
                         logger.warning(

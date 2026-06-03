@@ -90,7 +90,8 @@ Worker
   ├── Activity 1: session₁ → fetch RSS → parse → fetch_full_contents → store → summarize → commit
   ├── Activity 2: session₂ → fetch RSS → parse → fetch_full_contents → store → summarize → commit
   └── Activity N: sessionₙ → ...
-       Each activity gets a fresh AsyncSession from the pool (pool_size=10, max_overflow=20)
+       Each activity gets a fresh AsyncSession from the pool (pool_size=10, max_overflow=20 → 30 conns/worker)
+       At scale: 30 conns × N workers can exceed Postgres limits; use PgBouncer or reduce per-worker pool size
 ```
 
 ## Data Flow
@@ -174,20 +175,26 @@ Session: aiohttp.ClientSession
 | 1 | 1s | Same |
 | 2 | 2s | Last attempt, then raises `RuntimeError` |
 
+**Temporal activity retry policy** (in `workflows.py:25-30`):
+- `maximum_attempts=3` — only triggers if the activity raises an exception
+- Permanent failures are persisted as task failures and returned (no exception) — Temporal does not retry
+- Only transient errors (network timeouts, rate limits, DB errors) propagate and trigger Temporal retries
+
 **Special status codes:**
-- **403/404/410 (Permanent)**: Raise `RuntimeError` immediately — no retry within activity, Temporal retries up to 3 times (~3s wasted per URL)
+- **403/404/410 (Permanent)**: Raise `RuntimeError` immediately — no retry within activity. Task is persisted as failed and temporal does not retry the activity
 - **429 (Rate limited)**: Respect `Retry-After` header if present, else exponential backoff 5s/10s/20s. After exhaustion, raise `ClientResponseError`
 - **5xx (Server error)**: Log warning, return body anyway — YouTube often returns 500 with valid XML body
 
 ## Performance
 
-### Feed-Level Timings (20 articles, same domain)
+### Feed-Level Timings (same domain)
 
 | Mode | Per-Feed Time | Total (101 feeds) |
 |-------|--------------|-------------------|
-| Sequential article fetch (before) | ~40-60s | ~25-40 min |
-| Concurrent article fetch (after) | ~12-20s | ~8-14 min |
-| YouTube (0 articles, fail fast) | ~3-5s | ~2-3 min |
+| Sequential article fetch (before, 20 articles) | ~40-60s | ~25-40 min |
+| Concurrent article fetch (after, 20 articles) | ~12-20s | ~8-14 min |
+| Concurrent article fetch (10 articles) | ~6-10s | ~4-7 min |
+| YouTube (0 articles, fail fast) | ~1-2s | ~0.5-1 min |
 
 ### Overall Job (101 URLs with all fixes)
 
@@ -197,7 +204,9 @@ Session: aiohttp.ClientSession
 | Permanently failed (in this run) | 34 (32 YouTube 404 + 2 Cloudflare 403) |
 | Additional URLs fixable by patches | 12 (8 YouTube 500 body + 4 YouTube headers) |
 | Expected with all fixes | 79/101 |
-| Total time (single worker) | ~10-15 min |
+| Total time (1 worker, max_articles=20) | ~10-15 min |
+| Total time (1 worker, max_articles=10) | ~6-8 min |
+| Total time (5 workers, max_articles=10) | ~2-3 min |
 | Bottleneck | Article-level HTTP fetching + summarization |
 
 ## Failure Analysis
