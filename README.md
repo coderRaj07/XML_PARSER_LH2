@@ -141,17 +141,17 @@ Worker (non-deterministic)
 
 ### Failure Analysis
 
-**Out of 101 URLs: 67 succeed, 34 permanently fail.**
+**Out of 101 URLs: 67 succeed, 32 permanently fail, 2 fixed by post-run patches.**
 
 #### Breakdown by Root Cause
 
-| Category | Failures | HTTP | Root Cause |
-|----------|----------|------|------------|
-| Invalid YouTube channel IDs | 30 | 404 | Channel deleted/renamed/never existed |
-| YouTube 500 with valid XML body | 8 | 500 | YouTube internal error, but body IS valid RSS — **fixed** |
-| YouTube 500 missing browser headers | 4 | 500 | Needs Sec-Fetch-* headers — **fixed** |
-| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | TLS fingerprint + JS challenge — **permanent** |
-| **Total** | **44** (original) - **10 fixed** = **34 permanent** | | |
+| Category | Count | HTTP | Verdict |
+|----------|-------|------|---------|
+| Invalid YouTube channel IDs | 30 | 404 | **Permanent** — channel never existed or was deleted |
+| YouTube 500 with valid XML body | 8 | 500 | **Fixed** — return body regardless of status code |
+| YouTube 500 missing browser headers | 4 | 500 | **Fixed** — added Sec-Fetch-* headers |
+| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | **Permanent** — needs headless browser |
+| **Total** | **44** | | **32 permanent + 12 fixed** |
 
 #### What Was Fixed
 
@@ -159,18 +159,17 @@ Worker (non-deterministic)
 |-----|-----------|----------|
 | Sec-Fetch-* headers (Chrome 134) | 4 | YouTube 500 missing headers |
 | Return 5xx body regardless of status | 8 | YouTube 500 with valid XML |
-| **Total fixed** | **12** | |
+| **Total fixed** | **12** | from 44 → 32 permanent |
 
-#### What Remains Permanent
+#### What Remains Permanent (32)
 
-1. **~30 YouTube 404s** — invalid channel IDs. YouTube returns 404 for deleted/nonexistent channels. No fix possible.
-2. **tripwire.com + sony.com (403)** — Cloudflare WAF checks TLS fingerprint + JS execution capability. A simple HTTP client cannot bypass these regardless of headers. Would need headless browser or residential proxies.
+30 YouTube channel IDs return HTTP 404. 2 sites (tripwire.com, sony.com) are blocked by Cloudflare WAF at the TLS/JS challenge level — beyond what header spoofing can bypass.
 
-#### Why 404 YouTube channels can't be fixed
-YouTube returns HTTP 404 with an error page body for deleted/nonexistent channels. The fetcher correctly treats 404 as a permanent error and does not retry.
+#### Why YouTube 404s can't be fixed
+YouTube returns HTTP 404 for deleted or nonexistent channels. The fetcher treats this as a permanent error without retries. No header or retry change will make these work.
 
 #### Why Cloudflare sites can't be fixed
-Cloudflare WAF inspects TLS fingerprint (JA3), JavaScript execution, and full browser integrity. A headless browser (Playwright/Selenium) or residential proxy rotation would be required, which is out of scope.
+Cloudflare WAF checks TLS fingerprint (JA3), JavaScript execution capability, and full browser integrity. A headless browser (Playwright/Selenium) or residential proxies would be required, which is out of scope.
 
 #### 10× Scale — 1,000 URLs
 

@@ -194,23 +194,24 @@ Session: aiohttp.ClientSession
 | Metric | Value |
 |--------|-------|
 | Successful feeds | 67 |
-| Permanently failed | 34 |
+| Permanently failed | 32 (30 YouTube 404 + 2 Cloudflare) |
+| Fixed by patches (applied after run) | 12 (8 YouTube 500 body + 4 YouTube headers) |
 | Total time (single worker) | ~10-15 min |
 | Bottleneck | Article-level HTTP fetching + summarization |
 
 ## Failure Analysis
 
-### Final Result: 67/101 succeed, 34 permanently fail
+### Final Result: 67/101 succeed, 32 permanently fail, 12 fixed by patches
 
 ### Category Breakdown
 
-| # | Category | Count | HTTP | Root Cause | Resolution |
-|---|----------|-------|------|------------|------------|
-| 1 | Invalid YouTube channel | 30 | 404 | Channel deleted/renamed/never existed | **Permanent** — no fix possible |
-| 2 | YouTube with valid XML body | 8 | 500 | YouTube internal error, body has RSS | **Fixed** — removed `raise_for_status()` for 5xx |
-| 3 | YouTube missing browser headers | 4 | 500 | Needs Sec-Fetch-* headers | **Fixed** — added Chrome 134 headers |
-| 4 | Cloudflare WAF (tripwire.com) | 1 | 403 | TLS fingerprint + JS challenge | **Permanent** — needs headless browser |
-| 5 | Cloudflare WAF (sony.com) | 1 | 403 | Same | **Permanent** — same limitation |
+| # | Category | Count | HTTP | Verdict |
+|---|----------|-------|------|---------|
+| 1 | Invalid YouTube channel | 30 | 404 | **Permanent** — channel deleted/never existed |
+| 2 | YouTube with valid XML body | 8 | 500 | **Fixed** — return body regardless of status |
+| 3 | YouTube missing browser headers | 4 | 500 | **Fixed** — added Sec-Fetch-* headers |
+| 4 | Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | **Permanent** — needs headless browser |
+| | **Total** | **44** | | **32 permanent + 12 fixed** |
 
 ### Error Handling Matrix
 
