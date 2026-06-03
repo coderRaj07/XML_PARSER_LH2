@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, LargeBinary, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -47,8 +47,10 @@ class RecordModel(Base):
     title: Mapped[str] = mapped_column(Text, default="")
     author: Mapped[str] = mapped_column(Text, default="")
     published_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source_link: Mapped[str] = mapped_column(Text, default="")
     description: Mapped[str] = mapped_column(Text, default="")
     content: Mapped[str] = mapped_column(Text, default="")
+    full_content: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
 
     task: Mapped["TaskModel"] = relationship("TaskModel", back_populates="records")
     summaries: Mapped[list["SummaryModel"]] = relationship("SummaryModel", back_populates="record", cascade="all, delete-orphan")

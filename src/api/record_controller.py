@@ -1,3 +1,4 @@
+import gzip
 import html
 import re
 
@@ -42,6 +43,7 @@ async def list_records(job_id: str, limit: int = 50, offset: int = 0) -> list[di
                 "title": record.title,
                 "author": record.author,
                 "published_date": str(record.published_date) if record.published_date else None,
+                "source_link": record.source_link,
                 "description": _clean_html(record.description),
                 "content": _clean_html(record.content, max_len=500),
                 "summary": _clean_html(summary.summary_text) if summary else None,
@@ -60,14 +62,22 @@ async def get_record(record_id: str) -> dict:
         if record is None:
             raise HTTPException(status_code=404, detail="Record not found")
         summary = await record_repo.get_summary(record.id)
+        full_content = None
+        if record.full_content:
+            try:
+                full_content = gzip.decompress(record.full_content).decode("utf-8")
+            except Exception:
+                pass
         return {
             "id": record.id,
             "task_id": record.task_id,
             "title": record.title,
             "author": record.author,
             "published_date": str(record.published_date) if record.published_date else None,
+            "source_link": record.source_link,
             "description": _clean_html(record.description),
             "content": _clean_html(record.content),
+            "full_content": full_content,
             "summary": _clean_html(summary.summary_text) if summary else None,
         }
     finally:

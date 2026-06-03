@@ -21,7 +21,8 @@ class RSSParser(ParserStrategy):
                     description=entry.get("summary", ""),
                     content=entry.get("content", [{}])[0].get("value", "")
                     if entry.get("content")
-                    else entry.get("summary", ""),
+                    else "",
+                    source_link=entry.get("link", ""),
                 )
             )
         return records

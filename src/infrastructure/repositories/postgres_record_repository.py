@@ -91,8 +91,10 @@ class PostgresRecordRepository(RecordRepository):
             title=record.title,
             author=record.author,
             published_date=record.published_date,
+            source_link=record.source_link,
             description=record.description,
             content=record.content,
+            full_content=record.full_content,
         )
 
     @staticmethod
@@ -103,6 +105,8 @@ class PostgresRecordRepository(RecordRepository):
             title=model.title,
             author=model.author,
             published_date=model.published_date,
+            source_link=model.source_link,
             description=model.description,
             content=model.content,
+            full_content=model.full_content,
         )

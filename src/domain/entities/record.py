@@ -13,3 +13,5 @@ class Record:
     published_date: Optional[datetime] = None
     description: str = ""
     content: str = ""
+    source_link: str = ""
+    full_content: Optional[bytes] = None
