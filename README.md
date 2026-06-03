@@ -125,18 +125,20 @@ Workflow (deterministic)
     │
     ▼
 Worker (non-deterministic)
-    ├──► Activity 1: fetch RSS → parse → fetch_full_contents* → store → summarize → commit
-    ├──► Activity 2: fetch RSS → parse → fetch_full_contents* → store → summarize → commit
+    ├──► Activity 1: fetch RSS → parse → fetch_full_contents* → store → summarize** → commit
+    ├──► Activity 2: fetch RSS → parse → fetch_full_contents* → store → summarize** → commit
     └──► Activity N: ...
          * Article content fetching is concurrent within each activity:
            asyncio.gather with per-domain Semaphore(2) + 1s throttle
+         ** CPU-bound summarization offloaded to thread pool via asyncio.to_thread
+            — prevents blocking other activities' I/O on the event loop
 ```
 
 - **Feed-level**: all URLs dispatched concurrently via Temporal `asyncio.gather`
 - **Article-level**: within a feed, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
 - **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory
 - **Shared aiohttp session** — long-lived `ClientSession` reused across all activities
-- **No thread pool** — all I/O is asyncio-based; CPU-bound summarization runs inline (blocks event loop)
+- **Thread pool for CPU-bound work** — I/O is asyncio-based; CPU-bound summarization (TextRank/TF-IDF/LSA) is offloaded via `asyncio.to_thread` so it doesn't block other activities' I/O
 - **Worker dispatch** — max ~200 concurrent activities; beyond that Temporal queues server-side
 
 ### Failure Analysis
@@ -154,9 +156,9 @@ Worker (non-deterministic)
 | 🌐 aiohttp connector limit         | `TCPConnector(limit=100)`                     | HTTP requests queue up — latency, no failures                          |
 | ⚙️ Temporal worker concurrency     | ~200 concurrent activities                     | Beyond 200, Temporal queues server-side                                |
 | 🗄️ PostgreSQL write throughput     | ~5K-20K writes/sec                            | 50K records → ~1s. Fine.                                               |
-| 💻 Single-worker CPU (summarize)   | TextRank/TF-IDF on event loop                 | Summaries one-at-a-time; CPU bottleneck at scale                       |
+| 💻 Single-worker CPU (summarize)   | TextRank/TF-IDF offloaded to thread pool      | CPU bottleneck at scale (mitigated by offloading I/O blocking)         |
 
-**Verdict: 1,000 URLs would work but take ~10-15 min instead of 2.**
+**Verdict: 1,000 URLs would work but take ~10-15 min.**
 
 #### 100× Scale — 10,000 URLs
 
@@ -189,7 +191,7 @@ Worker (non-deterministic)
 |-------------------------------------------|------------------------------------|---------------------------------------------------------------------------------------------|
 | `asyncio.gather` on all URLs at once      | Simplest for 100 URLs              | **Semaphore-bounded gather** — dispatch N at a time                                         |
 | Single Temporal worker                    | Simple container                   | **Multiple replicas** + process pool for CPU-bound work                                     |
-| Inline CPU-bound summarization in activity| Avoids extra infra                 | **`run_in_executor`** or push to separate background service                                |
+| CPU-bound summarization via `asyncio.to_thread` | Avoids blocking event loop         | **Process pool** or push to separate async LLM service                                      |
 | `postgresql+asyncpg` per-activity session | Fixes concurrency                  | **SQLAlchemy 2.0 async** + write-through Redis cache                                        |
 | Docker Compose single-host                | Easy local dev                     | **Kubernetes** for multi-worker, auto-scaling                                               |
 | No progress reporting                     | `describe_workflow` only           | **WebSocket/SSE** + Redis pub/sub for real-time progress                                    |
