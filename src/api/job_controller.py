@@ -34,9 +34,8 @@ async def create_job(request: CreateJobRequest) -> CreateJobResponse:
         job = await service.create_job(request.urls)
         await repo.commit()
         return CreateJobResponse(job_id=job.id)
-    except Exception:
+    finally:
         await repo.close()
-        raise
 
 
 @router.get("/{job_id}", response_model=JobStatusResponse)

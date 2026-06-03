@@ -51,9 +51,8 @@ class URLProcessingActivity:
         try:
             updated_task = await task_processor.process_task(task)
             await job_repo.commit()
-        except Exception:
+        finally:
             await job_repo.close()
-            raise
 
         return {
             "task_id": updated_task.id,
