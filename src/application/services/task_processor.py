@@ -161,7 +161,7 @@ class TaskProcessor:
                 source_text = record.description or ""
             if _is_garbage(source_text):
                 source_text = record.title or ""
-            summary_text = self._summary_service.generate_summary(source_text)
+            summary_text = await asyncio.to_thread(self._summary_service.generate_summary, source_text)
             summary = Summary(
                 record_id=record.id,
                 summary_text=summary_text,
