@@ -24,8 +24,6 @@ class ExtractiveSummaryStrategy(SummaryStrategy):
 
         clean = self._strip_html(content)
         sentences = self._split_sentences(clean)
-        if len(sentences) <= self.sentences_count:
-            return clean
 
         textrank = self._summarize_textrank(clean)
         if textrank:
@@ -39,7 +37,7 @@ class ExtractiveSummaryStrategy(SummaryStrategy):
         if lsa:
             return lsa
 
-        return " ".join(sentences[: self.sentences_count])
+        return " ".join(sentences[:min(self.sentences_count, len(sentences))])
 
     def _summarize_textrank(self, content: str) -> Optional[str]:
         try:
