@@ -141,24 +141,15 @@ Worker (non-deterministic)
 
 ### Failure Analysis
 
-**67/101 succeed. 34 fail — all permanent (no 500s in this run).**
+**Final result: 67/101 succeed. 34 permanently fail.**
 
-| Reason | Count | HTTP | Fixable? |
-|--------|-------|------|----------|
-| Invalid/deleted YouTube channels | 32 | 404 | No — channel never existed or was removed |
-| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | No — TLS fingerprint + JS challenge |
-| **Total** | **34** | | |
+| Reason | Count | HTTP |
+|--------|-------|------|
+| Invalid/deleted YouTube channels | 32 | 404 |
+| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 |
+| **Total** | **34** | |
 
-#### Separately fixed (from earlier runs, not in the 34 above)
-
-12 YouTube channels that previously returned HTTP 500 (with valid XML body) were fixed:
-
-| Fix | URLs | Issue |
-|-----|------|-------|
-| Return 5xx body regardless of status | 8 | YouTube 500 with valid RSS body |
-| Added Sec-Fetch-* browser headers | 4 | YouTube requires modern security headers |
-
-With these fixes applied, expected total: **79/101**.
+The 34 failures are all HTTP 404 (invalid YouTube channel IDs) or HTTP 403 (Cloudflare WAF blocking) — no amount of header tweaking or retries can fix these.
 
 #### 10× Scale — 1,000 URLs
 
