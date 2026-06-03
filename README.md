@@ -139,37 +139,38 @@ Worker (non-deterministic)
 - **No thread pool** — all I/O is asyncio-based; CPU-bound summarization runs inline (blocks event loop)
 - **Worker dispatch** — max ~200 concurrent activities; beyond that Temporal queues server-side
 
-### Scaling Analysis
+### Failure Analysis
 
-Tested at **101 URLs**: **97 completed, 4 permanently failed** (~2 min initial + retries for fixes).
+**Out of 101 URLs: 67 succeed, 34 permanently fail.**
 
-| Run | URLs | Completed | Failed | Notes |
-|-----|------|-----------|--------|-------|
-| Initial (pre-fixes) | 101 | 50 | 51 | Baseline before any fixes |
-| Retry 1 (UA + throttle fix) | 51 | 35 | 16 | fixed: complex.com 403, cinemablend pending, CancelledError crashes |
-| Retry 2 (Sec-Fetch + 5xx body) | 14 YouTube | 12 | 2 | fixed: YouTube 500s with valid XML body |
-| **Total unique** | **101** | **97** | **4** | see failure analysis below |
+#### Breakdown by Root Cause
 
-### Failure Analysis (34 failures in the original run → 4 permanent after all fixes)
+| Category | Failures | HTTP | Root Cause |
+|----------|----------|------|------------|
+| Invalid YouTube channel IDs | 30 | 404 | Channel deleted/renamed/never existed |
+| YouTube 500 with valid XML body | 8 | 500 | YouTube internal error, but body IS valid RSS — **fixed** |
+| YouTube 500 missing browser headers | 4 | 500 | Needs Sec-Fetch-* headers — **fixed** |
+| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | TLS fingerprint + JS challenge — **permanent** |
+| **Total** | **44** (original) - **10 fixed** = **34 permanent** | | |
 
-| Category | Count | Root Cause | Verdict |
-|----------|-------|------------|---------|
-| YouTube 404 (invalid channel ID) | ~30 | Channel deleted or never existed. YouTube returns HTTP 404 with error page. | **Permanent** — no fix possible |
-| YouTube 500 with valid XML body | ~8 | YouTube internal error, but response body contains the valid RSS feed XML | **Fixed** — now return body regardless of status code |
-| YouTube 500 missing Sec-Fetch headers | ~4 | YouTube requires `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, etc. modern browser security headers | **Fixed** — added all Sec-Fetch-* headers |
-| tripwire.com 403 (Cloudflare WAF) | 1 | Cloudflare WAF blocks non-browser traffic. Beyond simple UA spoofing. | **Permanent** — would need headless browser or proxy rotation |
-| sony.com 403 (Cloudflare WAF) | 1 | Same as above — Cloudflare-level blocking | **Permanent** — same limitation |
+#### What Was Fixed
 
-#### Why 32 YouTube channels are permanently dead
-YouTube RSS feeds for non-existent or deleted channels return HTTP 404 with an error page. These channel IDs likely belong to:
-- Channels that were deleted or renamed by the owner
-- Typo'd or invalid channel IDs from the original URL list
-- Channels that never existed (random/placeholder IDs)
+| Fix | URLs Saved | Category |
+|-----|-----------|----------|
+| Sec-Fetch-* headers (Chrome 134) | 4 | YouTube 500 missing headers |
+| Return 5xx body regardless of status | 8 | YouTube 500 with valid XML |
+| **Total fixed** | **12** | |
 
-The fetcher treats 404 as a permanent error and does not retry.
+#### What Remains Permanent
 
-#### Why tripwire.com and sony.com are permanently blocked
-Both sites use Cloudflare's WAF (Web Application Firewall), which inspects TLS fingerprints, JavaScript execution capability, and browser integrity — not just headers. A simple HTTP client cannot bypass this regardless of User-Agent or headers. Solutions would require headless browser rendering or residential proxy rotation, which are out of scope.
+1. **~30 YouTube 404s** — invalid channel IDs. YouTube returns 404 for deleted/nonexistent channels. No fix possible.
+2. **tripwire.com + sony.com (403)** — Cloudflare WAF checks TLS fingerprint + JS execution capability. A simple HTTP client cannot bypass these regardless of headers. Would need headless browser or residential proxies.
+
+#### Why 404 YouTube channels can't be fixed
+YouTube returns HTTP 404 with an error page body for deleted/nonexistent channels. The fetcher correctly treats 404 as a permanent error and does not retry.
+
+#### Why Cloudflare sites can't be fixed
+Cloudflare WAF inspects TLS fingerprint (JA3), JavaScript execution, and full browser integrity. A headless browser (Playwright/Selenium) or residential proxy rotation would be required, which is out of scope.
 
 #### 10× Scale — 1,000 URLs
 
@@ -377,4 +378,4 @@ Copy this into Swagger UI at `http://localhost:8000/docs`:
 | Document | Description |
 |----------|-------------|
 | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture diagrams, concurrency model, design decisions, scaling analysis, tradeoffs |
-| [`FIXES.md`](docs/FIXES.md) | Complete log of all 10 issues faced during development and how they were resolved |
+| [`FIXES.md`](docs/FIXES.md) | Complete log of all 11 issues faced during development and how they were resolved |

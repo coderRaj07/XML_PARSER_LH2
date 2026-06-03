@@ -146,20 +146,85 @@ Worker commits DB session → Job progress updated
 - Each activity commits independently (partial success)
 - Rollback scope is per-activity, not per-job
 
+## Fetcher Design
+
+### HTTP Client Configuration
+
+```
+Session: aiohttp.ClientSession
+  ├── Connector: TCPConnector(limit=100, limit_per_host=2)
+  ├── Timeout: ClientTimeout(total=30s)
+  ├── Headers: Chrome 134 browser headers
+  │     ├── User-Agent: Mozilla/5.0 ... Chrome/134 ...
+  │     ├── Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8
+  │     ├── Accept-Language: en-US,en;q=0.9
+  │     ├── Sec-Fetch-Dest: document
+  │     ├── Sec-Fetch-Mode: navigate
+  │     ├── Sec-Fetch-Site: none
+  │     ├── Sec-Fetch-User: ?1
+  │     └── Upgrade-Insecure-Requests: 1
+  └── CookieJar (implicit, per-session)
+```
+
+### Retry Policy
+
+| Attempt | Backoff | Triggers |
+|---------|---------|----------|
+| 0 | immediate | Any non-2xx except 403/404/410/429 |
+| 1 | 1s | Same |
+| 2 | 2s | Last attempt, then raises `RuntimeError` |
+
+**Special status codes:**
+- **403/404/410 (Permanent)**: Raise `RuntimeError` immediately — no retry within activity, Temporal retries up to 3 times (~3s wasted per URL)
+- **429 (Rate limited)**: Respect `Retry-After` header if present, else exponential backoff 5s/10s/20s. After exhaustion, raise `ClientResponseError`
+- **5xx (Server error)**: Log warning, return body anyway — YouTube often returns 500 with valid XML body
+
 ## Performance
 
-Feed-level timings (20 articles, same domain):
-- Sequential (before): ~40-60s per feed
-- Concurrent (after): ~12-20s per feed
-- YouTube channels (0 articles): ~3-5s total
+### Feed-Level Timings (20 articles, same domain)
 
-## Failure Modes
+| Mode | Per-Feed Time | Total (101 feeds) |
+|-------|--------------|-------------------|
+| Sequential article fetch (before) | ~40-60s | ~25-40 min |
+| Concurrent article fetch (after) | ~12-20s | ~8-14 min |
+| YouTube (0 articles, fail fast) | ~3-5s | ~2-3 min |
+
+### Overall Job (101 URLs with all fixes)
+
+| Metric | Value |
+|--------|-------|
+| Successful feeds | 67 |
+| Permanently failed | 34 |
+| Total time (single worker) | ~10-15 min |
+| Bottleneck | Article-level HTTP fetching + summarization |
+
+## Failure Analysis
+
+### Final Result: 67/101 succeed, 34 permanently fail
+
+### Category Breakdown
+
+| # | Category | Count | HTTP | Root Cause | Resolution |
+|---|----------|-------|------|------------|------------|
+| 1 | Invalid YouTube channel | 30 | 404 | Channel deleted/renamed/never existed | **Permanent** — no fix possible |
+| 2 | YouTube with valid XML body | 8 | 500 | YouTube internal error, body has RSS | **Fixed** — removed `raise_for_status()` for 5xx |
+| 3 | YouTube missing browser headers | 4 | 500 | Needs Sec-Fetch-* headers | **Fixed** — added Chrome 134 headers |
+| 4 | Cloudflare WAF (tripwire.com) | 1 | 403 | TLS fingerprint + JS challenge | **Permanent** — needs headless browser |
+| 5 | Cloudflare WAF (sony.com) | 1 | 403 | Same | **Permanent** — same limitation |
+
+### Error Handling Matrix
 
 | Scenario | Behavior |
 |----------|----------|
-| RSS feed 404 | Task failed permanently, no retry |
-| RSS feed 500 with body | Body returned anyway, parser validates |
-| Article fetch timeout | Skipped (warning logged), other articles continue |
-| Article garbage content | Skipped (garbage detected), not stored |
-| DB connection failure | Activity rollback, retry by Temporal |
-| Temporal cancellation | Partial results saved, activity marked cancelled |
+| RSS feed HTTP 404 | Permanent failure — `RuntimeError`, no retry within activity |
+| RSS feed HTTP 403 | Permanent failure — same as 404 |
+| RSS feed HTTP 500 with body | **Body returned anyway** — parser downstream validates content |
+| RSS feed HTTP 429 | Retry with `Retry-After` or exponential backoff (5s/10s/20s) |
+| RSS feed connection timeout | Retry with 1s/2s backoff, up to 3 attempts |
+| Article link HTTP 404/403 | Permanent failure — skipped, other articles continue |
+| Article link HTTP 500 | Body returned, trafilatura may extract nothing |
+| Article link timeout | Logged as warning, article skipped |
+| Trafilatura garbage content | `_is_garbage()` detection — not stored, summary falls back to description/title |
+| DB connection failure | Activity rollback, retry by Temporal (1s/2s/4s/.../30s backoff) |
+| Temporal cancellation during throttle sleep | CancelledError caught — partial results saved, activity marked cancelled |
+| Worker restart mid-processing | In-flight activities fail, Temporal retries them
