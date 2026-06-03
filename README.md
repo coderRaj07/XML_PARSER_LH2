@@ -125,12 +125,15 @@ Workflow (deterministic)
     │
     ▼
 Worker (non-deterministic)
-    ├──► Activity 1: session_factory() → session₁ → fetch → parse → store → summarize → commit → close
-    ├──► Activity 2: session_factory() → session₂ → fetch → parse → store → summarize → commit → close
-    └──► Activity N: session_factory() → sessionₙ → ...
-         Each activity gets its own DB connection from the pool (pool_size=10, max_overflow=20)
+    ├──► Activity 1: fetch RSS → parse → fetch_full_contents* → store → summarize → commit
+    ├──► Activity 2: fetch RSS → parse → fetch_full_contents* → store → summarize → commit
+    └──► Activity N: ...
+         * Article content fetching is concurrent within each activity:
+           asyncio.gather with per-domain Semaphore(2) + 1s throttle
 ```
 
+- **Feed-level**: all URLs dispatched concurrently via Temporal `asyncio.gather`
+- **Article-level**: within a feed, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
 - **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory
 - **Shared aiohttp session** — long-lived `ClientSession` reused across all activities
 - **No thread pool** — all I/O is asyncio-based; CPU-bound summarization runs inline (blocks event loop)
@@ -138,7 +141,14 @@ Worker (non-deterministic)
 
 ### Scaling Analysis
 
-Tested at **101 URLs**: 97 completed, 4 failed, ~2 min.
+Tested at **101 URLs**: **97 completed, 4 permanently failed** (~2 min initial + retries for fixes).
+
+| Run | URLs | Completed | Failed | Notes |
+|-----|------|-----------|--------|-------|
+| Initial | 101 | 50 | 50+1 | Pre-fixes baseline |
+| Retry 1 (UA + throttle fix) | 51 | 35 | 16 | complex.com, cinemablend, etc. fixed |
+| Retry 2 (Sec-Fetch + 5xx body) | 14 YouTube | 12 | 2 | YouTube channel with valid XML fixed |
+| **Total unique** | **101** | **97** | **4** | tripwire, sony, 2 dead YouTube channels |
 
 #### 10× Scale — 1,000 URLs
 

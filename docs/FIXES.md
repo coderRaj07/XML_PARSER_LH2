@@ -1,142 +1,119 @@
-# Issues Faced & How They Were Fixed
+# Fixes & Issues Log
 
-## 1. Task ID Mismatch Between API and Worker
+## 1. YouTube RSS Feeds Returning 500 with Valid XML
 
-**Symptom:** `ValueError: Task {id} not found` — worker tried to `UPDATE tasks WHERE id = '{job_id}-{idx}'` but tasks were stored with UUID primary keys.
+**Issue:** YouTube returns HTTP 500 for some RSS feed URLs, but the response body contains valid XML feed content. The fetcher was calling `response.raise_for_status()` which raised on 5xx, discarding the body.
 
-**Root Cause:** `JobService.create_job()` created tasks in the DB with auto-generated UUID IDs via `Task(id=field(default_factory=lambda: str(uuid4())))`. Meanwhile, the Temporal workflow generated synthetic IDs as `f"{job_id}-{idx}"`. The activity then created an in-memory `Task(id=synthetic_id)` and called `task_repository.update()`, which did a `SELECT` by that ID — which never matched.
+**Fix:** Removed `raise_for_status()` for 5xx responses. Now logs a warning and returns the body regardless. The parser validates content downstream.
 
-**Fix:** Changed `ExecutionEngine.start_job()` to accept `list[tuple[str, str]]` of `(task_id, url)` pairs instead of just `list[str]` of URLs. `JobService.create_job()` now passes `[(task.id, task.url) for task in tasks]` to the engine. The workflow iterates over real `(task_id, url)` pairs instead of generating synthetic IDs.
-
-**Files changed:**
-- `src/application/interfaces/execution_engine.py` — signature change
-- `src/infrastructure/temporal/temporal_engine.py` — pass task data
-- `src/infrastructure/temporal/workflows.py` — use `tasks: list[tuple[str, str]]`
-- `src/application/services/job_service.py` — pass real task IDs
+**Files:** `src/infrastructure/fetchers/aiohttp_fetcher.py:81-88`
 
 ---
 
-## 2. Concurrent DB Session Contention
+## 2. YouTube Requires Sec-Fetch-* Headers
 
-**Symptom:** `InterfaceError: cannot perform operation: another operation is in progress` — multiple Temporal activities running concurrently on the same SQLAlchemy session/asyncpg connection.
+**Issue:** Some YouTube RSS feeds refused to serve content (500 error) without modern browser security headers.
 
-**Root Cause:** The worker created a single session and shared it across all `URLProcessingActivity` invocations. When `asyncio.gather` fanned out 101 concurrent activities, they all called `session.execute()` on the same asyncpg connection simultaneously.
+**Fix:** Added `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, `Sec-Fetch-Site`, `Sec-Fetch-User`, and `Upgrade-Insecure-Requests` headers to the default request headers. Also updated `Accept` and `Accept-Language` to match Chrome 134.
 
-**Fix:** Moved session creation inside each activity invocation. `URLProcessingActivity` now accepts a `session_factory` (an `async_sessionmaker`) and creates a fresh `AsyncSession` (and fresh repo instances) inside each `process_url()` call. Each activity gets its own connection from the pool.
-
-**Files changed:**
-- `src/infrastructure/temporal/activities.py` — per-call session/repo creation
-- `src/infrastructure/temporal/worker.py` — accept `session_factory` instead of pre-built repos
-- `src/infrastructure/temporal/run_worker.py` — pass `session_factory`
+**Files:** `src/infrastructure/fetchers/aiohttp_fetcher.py:10-19`
 
 ---
 
-## 3. AioHttp ClientSession Closed Early
+## 3. Permanent HTTP Errors (403/404/410) Waste Retries
 
-**Symptom:** `Fetch attempt failed: Session is closed` — concurrent HTTP fetches failed after the first request succeeded.
+**Issue:** Permanent errors (404 invalid YouTube channel, 403 Cloudflare block) were handled by `raise_for_status()` which raised a `ClientResponseError` caught by `except Exception`, causing 3 wasteful retry attempts before failing.
 
-**Root Cause:** `AioHttpFetcher.fetch()` created a new `aiohttp.ClientSession` inside each call using `async with` (context manager) but shared a single `TCPConnector` across all calls. When the first `ClientSession` exited its `async with` block, it closed itself **and** the shared connector, breaking all subsequent sessions.
+**Fix:** For `_PERMANENT_STATUSES`, raise `RuntimeError` immediately with a clear message. Re-raise this error directly from the exception handler without retrying.
 
-**Fix:** Moved `ClientSession` creation to `__init__` as a long-lived instance attribute instead of creating a new one per `fetch()` call. The session persists for the lifetime of the fetcher and is properly closed via an explicit `close()` method.
-
-**Files changed:**
-- `src/infrastructure/fetchers/aiohttp_fetcher.py` — long-lived `ClientSession`
+**Files:** `src/infrastructure/fetchers/aiohttp_fetcher.py:51-62, 92-94`
 
 ---
 
-## 4. Timezone-Aware Datetime in TIMESTAMP WITHOUT TIME ZONE Column
+## 4. Temporal CancelledError During Full-Content Throttle Sleep
 
-**Symptom:** `DataError: invalid input for query argument $5 ... can't subtract offset-naive and offset-aware datetimes` — inserting records into PostgreSQL failed.
+**Issue:** The 2.5s per-domain throttle in `_fetch_full_contents` caused 50-90s total sleep time for 20-article feeds. `asyncio.CancelledError` (a `BaseException`, not `Exception`) raised during sleep was not caught by `except Exception`, causing the entire task to fail even though the RSS feed was already fetched and parsed successfully. This created ~11 false failures after trafilatura was introduced.
 
-**Root Cause:** The RSS parser used `dateutil.parser.parse()` on feed dates, which returns timezone-aware `datetime` objects (e.g., with `tzutc()`). The database column was `TIMESTAMP WITHOUT TIME ZONE`, and SQLAlchemy/asyncpg raised an error when trying to bind a tz-aware value to a tz-naive column.
+**Fix:** 
+- Reduced throttle from 2.5s to 1.0s
+- Moved sleep inside the try/except block so `CancelledError` is caught and partial results are saved
+- Added explicit `CancelledError` handler in `process_task` that marks task as failed and re-raises
+- In `_fetch_full_contents`, `CancelledError` during sleep returns early (saving records processed so far) instead of letting it cascade
 
-**Fix:** Added UTC normalization in `RSSParser._parse_date()` — after parsing, if the datetime has a `tzinfo`, it is converted to UTC via `.astimezone(timezone.utc)` and then stripped of tzinfo via `.replace(tzinfo=None)`.
-
-**Files changed:**
-- `src/application/strategies/parser/rss_parser.py` — naive UTC conversion
-
----
-
-## 5. PendingRollbackError After DB Failure
-
-**Symptom:** After a DB error (e.g., the timezone issue above), all subsequent operations on the same session failed with `PendingRollbackError: This Session's transaction has been rolled back due to a previous exception during flush.`
-
-**Root Cause:** When `_store_records()` or `_summarize()` raised a DB exception, `TaskProcessor.process_task()` caught it, marked the task as failed, and called `task_repository.update()`. But the session was in a broken state — SQLAlchemy requires an explicit `rollback()` before the session can be reused.
-
-**Fix:**
-1. Added `rollback()` method to all repository interfaces and PostgreSQL implementations.
-2. In `process_task()`, call `await self._task_repository.rollback()` in the `except` block before attempting the failed-status update.
-
-**Files changed:**
-- `src/application/interfaces/repositories.py` — added `rollback()` to all three interfaces
-- `src/infrastructure/repositories/*.py` — implemented `rollback()` in all three repos
-- `src/application/services/task_processor.py` — call rollback on failure
+**Files:** `src/application/services/task_processor.py:80-84, 127-149`
 
 ---
 
-## 6. HTML Content in Summaries
+## 5. Sequential Article Fetching Too Slow (20 Articles = ~60s)
 
-**Symptom:** Summaries contained raw HTML (`<img>`, `<a>`, `<p>` tags) instead of clean text.
+**Issue:** `_fetch_full_contents` used a plain `for` loop — one article at a time, sequential. 20 articles × 1s throttle + ~1-2s fetch = ~40-60s per feed, regardless of domain diversity.
 
-**Root Cause:** RSS feed content is typically HTML. The `ExtractiveSummaryStrategy` fed raw HTML directly to `sumy`'s `PlaintextParser` and `TfidfVectorizer`, which couldn't parse it into meaningful sentences. All three algorithms (TextRank, TF-IDF, LSA) silently failed, falling back to `" ".join(sentences[:5])` — which returned raw HTML because the sentence splitter couldn't split HTML on `[.!?]`.
+**Fix:** Rewrote to use `asyncio.gather` with per-domain `asyncio.Semaphore(2)` (matching `limit_per_host=2`). Articles from different domains run fully concurrently. Articles from the same domain run up to 2 at a time with the 1s throttle between start times.
 
-**Fix:** Added `_strip_html()` method that:
-1. Removes HTML tags with `re.sub(r"<[^>]+>", " ", text)`
-2. Unescapes HTML entities via `html.unescape()`
-3. Strips URLs with `re.sub(r"https?://\S+", "", text)`
-4. Normalizes whitespace
+**Before:** 20 articles on same domain → ~40-60s  
+**After:** 20 articles on same domain → ~12-20s (2× faster); articles on different domains → ~1-3s total
 
-This runs before any summarization algorithm, so TextRank/TF-IDF/LSA receive clean plain text.
-
-**Files changed:**
-- `src/application/strategies/summary/extractive_summary_strategy.py` — added `_strip_html()`
+**Files:** `src/application/services/task_processor.py:105-149`
 
 ---
 
-## 7. HTML in API Response Fields
+## 6. Complex.com / Tripwire.com / Sony.com Bot Blocking
 
-**Symptom:** API endpoints returned raw HTML in `description`, `content`, and `summary` fields.
+**Issue:** These sites returned 403/403/403 — blocked by Cloudflare WAF or bot detection.
 
-**Fix:** Added `_clean_html()` helper in `record_controller.py` that strips HTML tags, unescapes entities, removes URLs, and normalizes whitespace from all text fields before returning them in API responses.
+**Fix:** 
+- Added Chrome 134 browser User-Agent instead of aiohttp/bot-identifying UA
+- Added `Accept` and `Accept-Language` headers
+- **Result:** complex.com fixed. Tripwire.com and sony.com still blocked (Cloudflare-level, beyond UA spoofing).
 
-**Files changed:**
-- `src/api/record_controller.py` — added `_clean_html()` and applied it to all text fields
-
----
-
-## 8. NameError After Parameter Rename
-
-**Symptom:** `NameError: name 'urls' is not defined` in workflow execution.
-
-**Root Cause:** When renaming the workflow parameter from `urls` to `tasks`, the `return` statement at the bottom still referenced `len(urls)` instead of `len(tasks)`.
-
-**Fix:** Updated the return dict to use `len(tasks)`.
-
-**Files changed:**
-- `src/infrastructure/temporal/workflows.py` — fixed variable name in return
+**Files:** `src/infrastructure/fetchers/aiohttp_fetcher.py:10-19`
 
 ---
 
-## 9. DI Container: JobService Not Registered
+## 7. HuggingFace 429 Rate Limiting
 
-**Symptom:** `KeyError` when `job_controller.py` tried to look up `JobService` from the DI container.
+**Issue:** HuggingFace blog feed returned 429 (rate limited) on repeated requests. The fetcher had no backoff for 429 responses.
 
-**Root Cause:** The original code registered the `JobService` under the concrete class but the controller looked it up by the abstract type `JobService` (or vice versa). The container used a simple dict keyed by type, and the registration/lookup type mismatch caused a miss.
+**Fix:** Added 429 handler with `Retry-After` header support and exponential backoff (5s / 10s / 20s). After exhausting retries, raises a specific `ClientResponseError`.
 
-**Fix:** Changed `job_controller.py` to call `main.get_job_service()` directly instead of using the DI container lookup, since `JobService` requires per-request session wiring.
-
-**Files changed:**
-- `src/api/job_controller.py` — direct factory call instead of container lookup
+**Files:** `src/infrastructure/fetchers/aiohttp_fetcher.py:63-80`
 
 ---
 
-## 10. Session Closed Before Use
+## 8. Anduril Feed with 473+ Articles
 
-**Symptom:** Queries failed because the database session was closed before the service could use it.
+**Issue:** A single feed (anduril.com) contained 473 articles. Processing all of them took excessive time and resources.
 
-**Root Cause:** `get_job_service()` in `main.py` used `async with session_factory() as session`, which closed the session when the `async with` block exited — before the caller could execute any queries.
+**Fix:** Added `max_articles=20` cap. Only the first 20 articles from any feed are processed for full content and summaries.
 
-**Fix:** Replaced `async with` with a direct `session = session_factory()` call, returning the session explicitly for the caller to manage (commit/close in the endpoint's try/finally).
+**Files:** `src/application/services/task_processor.py:67-73`
 
-**Files changed:**
-- `src/main.py` — removed `async with`, return session directly
+---
+
+## 9. "Please Enable JavaScript" Trafilatura Output
+
+**Issue:** Trafilatura sometimes extracted "Please enable javascript to continue" as article content for sites that require JS to render.
+
+**Fix:** Added `_is_garbage()` function that strips HTML tags and checks for known garbage patterns (enable javascript, click here if not redirected, etc.). Content detected as garbage is not stored; summary falls back to description or title.
+
+**Files:** `src/application/services/task_processor.py:31-37`
+
+---
+
+## 10. HTML-Only Descriptions as Summary Source
+
+**Issue:** Some feeds have HTML-only descriptions (e.g., `<img src="...">`) with no readable text. These passed length checks but produced empty summaries.
+
+**Fix:** `_is_garbage()` now strips HTML tags before checking length, so `<img>`-only descriptions (0 readable chars) are detected as garbage and skipped in the summary fallback chain.
+
+**Files:** `src/application/services/task_processor.py:31-37`
+
+---
+
+## 11. Temporal Activity Never Dispatched
+
+**Issue:** After worker restart, some activities in the `asyncio.gather` were never dispatched. The task stayed "pending" with 0 attempts indefinitely.
+
+**Fix:** Manual intervention — marked the stuck task as failed in the database. Root cause is a Temporal race condition during worker restart.
+
+**Files:** N/A (operational workaround)

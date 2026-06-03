@@ -1,5 +1,9 @@
+import asyncio
 import gzip
 import logging
+import time
+from asyncio import CancelledError
+from urllib.parse import urlparse
 
 import trafilatura
 
@@ -14,6 +18,24 @@ from src.domain.enums.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
 
+_GARBAGE_PATTERNS = [
+    "please enable javascript",
+    "enable javascript to continue",
+    "enable javascript to view",
+    "javascript is required",
+    "your browser does not support javascript",
+    "click here if you are not redirected",
+]
+
+
+def _is_garbage(text: str) -> bool:
+    import re as _re
+    clean = _re.sub(r"<[^>]+>", "", text).strip()
+    if len(clean) < 50:
+        return True
+    lowered = clean.lower()
+    return any(p in lowered for p in _GARBAGE_PATTERNS)
+
 
 class TaskProcessor:
     def __init__(
@@ -24,6 +46,7 @@ class TaskProcessor:
         task_repository: TaskRepository,
         record_repository: RecordRepository,
         job_repository: JobRepository,
+        max_articles: int = 20,
     ) -> None:
         self._fetcher = fetcher
         self._parser = parser
@@ -31,6 +54,7 @@ class TaskProcessor:
         self._task_repository = task_repository
         self._record_repository = record_repository
         self._job_repository = job_repository
+        self._max_articles = max_articles
 
     async def process_task(self, task: Task) -> Task:
         task.increment_attempts()
@@ -39,11 +63,25 @@ class TaskProcessor:
         try:
             raw_xml = await self._fetch(task)
             records = await self._parse(task, raw_xml)
+
+            original_count = len(records)
+            if len(records) > self._max_articles:
+                records = records[: self._max_articles]
+                logger.info(
+                    "articles_truncated",
+                    extra={"task_id": task.id, "original": original_count, "max": self._max_articles},
+                )
+
             await self._fetch_full_contents(records)
             await self._store_records(task, records)
             await self._summarize(records)
             task.mark_completed()
             logger.info("task_completed", extra={"task_id": task.id, "url": task.url})
+        except CancelledError:
+            task.mark_failed("Activity cancelled")
+            logger.info("task_cancelled", extra={"task_id": task.id, "url": task.url})
+            await self._task_repository.rollback()
+            raise
         except Exception as e:
             task.mark_failed(str(e))
             logger.error("task_failed", extra={"task_id": task.id, "url": task.url, "error": str(e)})
@@ -65,17 +103,50 @@ class TaskProcessor:
         return records
 
     async def _fetch_full_contents(self, records: list[Record]) -> None:
-        for record in records:
+        semaphores: dict[str, asyncio.Semaphore] = {}
+        last_request: dict[str, float] = {}
+        CONCURRENT_PER_DOMAIN = 2
+
+        async def _fetch_one(record: Record) -> None:
             if not record.source_link:
-                continue
-            try:
-                html = await self._fetcher.fetch(record.source_link)
-                extracted = trafilatura.extract(html)
-                if extracted:
-                    record.full_content = gzip.compress(extracted.encode("utf-8"))
-                    record.content = extracted
-            except Exception:
-                logger.warning("full_content_fetch_failed", extra={"record_id": record.id, "url": record.source_link})
+                return
+            domain = urlparse(record.source_link).netloc
+            if domain not in semaphores:
+                semaphores[domain] = asyncio.Semaphore(CONCURRENT_PER_DOMAIN)
+            async with semaphores[domain]:
+                now = time.monotonic()
+                since_last = now - last_request.get(domain, 0.0)
+                if since_last < 1.0:
+                    await asyncio.sleep(1.0 - since_last)
+                try:
+                    html = await self._fetcher.fetch(record.source_link)
+                    extracted = trafilatura.extract(html)
+                    if extracted and not _is_garbage(extracted):
+                        record.full_content = gzip.compress(extracted.encode("utf-8"))
+                        record.content = extracted
+                    elif extracted:
+                        logger.info(
+                            "extracted_content_garbage_skipped",
+                            extra={"record_id": record.id, "url": record.source_link, "text": extracted[:80]},
+                        )
+                except CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "full_content_fetch_failed",
+                        extra={"record_id": record.id, "url": record.source_link},
+                    )
+                finally:
+                    last_request[domain] = time.monotonic()
+
+        coros = [_fetch_one(r) for r in records if r.source_link]
+        if not coros:
+            return
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        for r in results:
+            if isinstance(r, CancelledError):
+                logger.info("full_content_cancelled")
+                raise r
 
     async def _store_records(self, task: Task, records: list[Record]) -> None:
         if records:
@@ -85,7 +156,11 @@ class TaskProcessor:
     async def _summarize(self, records: list[Record]) -> None:
         for record in records:
             logger.info("summary_started", extra={"record_id": record.id})
-            source_text = record.content or record.description or record.title
+            source_text = record.content or ""
+            if _is_garbage(source_text):
+                source_text = record.description or ""
+            if _is_garbage(source_text):
+                source_text = record.title or ""
             summary_text = self._summary_service.generate_summary(source_text)
             summary = Summary(
                 record_id=record.id,
