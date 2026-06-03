@@ -141,17 +141,10 @@ Worker (non-deterministic)
 
 ### Failure Analysis
 
-**Final result: 61 permanently fail.**
-
-| Reason | Count | HTTP |
-|--------|-------|------|
-| Invalid/deleted YouTube channels | 59 | 404 |
-| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 |
-| **Total** | **61** | |
-
-YouTube feeds tested: **62 total** — **3 passed**, **59 failed** (all HTTP 404 — invalid/deleted channel IDs).
-
-The 61 failures are all HTTP 404 (invalid/deleted YouTube channel IDs) or HTTP 403 (Cloudflare WAF blocking) — no amount of header tweaking or retries can fix these.
+| Domain | Issue |
+|--------|-------|
+| Invalid/deleted YouTube channels | HTTP 404 |
+| tripwire.com, sony.com | HTTP 403 (Cloudflare WAF)
 
 #### 10× Scale — 1,000 URLs
 
