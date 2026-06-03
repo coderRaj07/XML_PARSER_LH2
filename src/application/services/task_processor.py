@@ -129,8 +129,6 @@ class TaskProcessor:
                             "extracted_content_garbage_skipped",
                             extra={"record_id": record.id, "url": record.source_link, "text": extracted[:80]},
                         )
-                except CancelledError:
-                    raise
                 except Exception:
                     logger.warning(
                         "full_content_fetch_failed",
