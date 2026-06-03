@@ -18,9 +18,14 @@ docker compose up --build -d
 # Follow worker logs to monitor processing
 docker compose logs -f worker
 
-# API available at http://localhost:8000
-# Swagger UI at http://localhost:8000/docs
-# Temporal Dev UI at http://localhost:8233
+# API available at 
+http://localhost:8000
+
+# Swagger UI at 
+http://localhost:8000/docs
+
+# Temporal Dev UI at 
+http://localhost:8233
 
 # Submit a test job — open Swagger UI at http://localhost:8000/docs,
 # paste the payload below into the POST /jobs endpoint, and hit Execute
