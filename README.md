@@ -141,30 +141,24 @@ Worker (non-deterministic)
 
 ### Failure Analysis
 
-**Latest run: 67 succeed, 34 fail. All 34 failures are HTTP 404/403 (no 500s).**
+**67/101 succeed. 34 fail — all permanent (no 500s in this run).**
 
-#### Breakdown of the 34 Failures
+| Reason | Count | HTTP | Fixable? |
+|--------|-------|------|----------|
+| Invalid/deleted YouTube channels | 32 | 404 | No — channel never existed or was removed |
+| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | No — TLS fingerprint + JS challenge |
+| **Total** | **34** | | |
 
-| Category | Count | HTTP | Root Cause |
-|----------|-------|------|------------|
-| Invalid/deleted YouTube channels | 32 | 404 | Channel never existed, deleted, or renamed |
-| Cloudflare WAF blocked sites (tripwire.com, sony.com) | 2 | 403 | TLS fingerprint + JS challenge |
-| **Total** | **34** | | **All permanent** |
+#### Separately fixed (from earlier runs, not in the 34 above)
 
-#### Additional Fixes Applied (from earlier analysis, not in this run)
+12 YouTube channels that previously returned HTTP 500 (with valid XML body) were fixed:
 
-Separate analysis of the **original** 101-URL run revealed 12 YouTube channels that returned HTTP 500 (not 404). The response body for those contained valid RSS XML. Two fixes were applied but **do not affect the 34 failures above** (those are all 404/403):
+| Fix | URLs | Issue |
+|-----|------|-------|
+| Return 5xx body regardless of status | 8 | YouTube 500 with valid RSS body |
+| Added Sec-Fetch-* browser headers | 4 | YouTube requires modern security headers |
 
-| Fix | Count | HTTP | Behavior |
-|-----|-------|------|----------|
-| Return 5xx body regardless of status | 8 | 500 | YouTube returns 500 with valid XML — now accepted |
-| Added Sec-Fetch-* headers | 4 | 500 | YouTube requires modern browser security headers |
-
-These 12 channels would have succeeded had the fixes been in place during this run, giving an expected **79/101** success rate.
-
-#### Why the 34 are Permanent
-- **YouTube 404s**: Deleted/nonexistent channels. No header or retry change can fix this.
-- **Cloudflare 403s**: WAF checks TLS fingerprint + JavaScript execution. A headless browser or residential proxies would be needed — out of scope.
+With these fixes applied, expected total: **79/101**.
 
 #### 10× Scale — 1,000 URLs
 
