@@ -194,24 +194,30 @@ Session: aiohttp.ClientSession
 | Metric | Value |
 |--------|-------|
 | Successful feeds | 67 |
-| Permanently failed | 32 (30 YouTube 404 + 2 Cloudflare) |
-| Fixed by patches (applied after run) | 12 (8 YouTube 500 body + 4 YouTube headers) |
+| Permanently failed (in this run) | 34 (32 YouTube 404 + 2 Cloudflare 403) |
+| Additional URLs fixable by patches | 12 (8 YouTube 500 body + 4 YouTube headers) |
+| Expected with all fixes | 79/101 |
 | Total time (single worker) | ~10-15 min |
 | Bottleneck | Article-level HTTP fetching + summarization |
 
 ## Failure Analysis
 
-### Final Result: 67/101 succeed, 32 permanently fail, 12 fixed by patches
+### Latest Run: 67/101 succeed, 34 fail. All 34 are HTTP 404/403.
 
-### Category Breakdown
+| Category | Count | HTTP | Root Cause |
+|----------|-------|------|------------|
+| Invalid/deleted YouTube channels | 32 | 404 | Channel never existed or was deleted |
+| Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | TLS fingerprint + JS challenge |
+| **Total** | **34** | | **All permanent** |
 
-| # | Category | Count | HTTP | Verdict |
-|---|----------|-------|------|---------|
-| 1 | Invalid YouTube channel | 30 | 404 | **Permanent** — channel deleted/never existed |
-| 2 | YouTube with valid XML body | 8 | 500 | **Fixed** — return body regardless of status |
-| 3 | YouTube missing browser headers | 4 | 500 | **Fixed** — added Sec-Fetch-* headers |
-| 4 | Cloudflare WAF (tripwire.com, sony.com) | 2 | 403 | **Permanent** — needs headless browser |
-| | **Total** | **44** | | **32 permanent + 12 fixed** |
+### Additional Fixes (applied separately, not reflected in this run)
+
+| Fix | Count | HTTP | Behavior |
+|-----|-------|------|----------|
+| Return 5xx body regardless of status | 8 | 500 | YouTube 500 with valid XML — now accepted |
+| Added Sec-Fetch-* headers | 4 | 500 | YouTube requires modern browser security headers |
+
+These 12 channels would have succeeded with fixes applied, giving **79/101** expected.
 
 ### Error Handling Matrix
 
