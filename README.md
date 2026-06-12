@@ -37,10 +37,10 @@ curl http://localhost:8000/jobs/{job_id}
 curl "http://localhost:8000/jobs/{job_id}/records?limit=5"
 ```
 
-### Run with multiple workers (faster)
+##### Run with multiple workers (faster)
 
 ```bash
-# Scale to 5 workers after services are up
+# Scale to 5 worker replicas after services are up
 docker compose up -d --scale worker=5
 
 # Verify all workers are running
@@ -132,29 +132,23 @@ The system is built around **Temporal + asyncio** for concurrency rather than Ce
 ```
 Workflow (deterministic)
     │
-    ├──► asyncio.gather(
-    │       activity("process_url", task_1, url_1),
-    │       activity("process_url", task_2, url_2),
-    │       ...                              ← all dispatched concurrently
-    │   )
+    ├── Stage 1: Fetch all URLs ──────────────────────────────► xml-feed-fetch-queue (5 workers)
+    │      fetch_url(task_id, url, job_id) → raw_xml
     │
-    ▼
-Worker (non-deterministic)
-    ├──► Activity 1: fetch RSS → parse → fetch_full_contents* → store → summarize** → commit
-    ├──► Activity 2: fetch RSS → parse → fetch_full_contents* → store → summarize** → commit
-    └──► Activity N: ...
-         * Article content fetching is concurrent within each activity:
-           asyncio.gather with per-domain Semaphore(2) + 1s throttle
-         ** CPU-bound summarization offloaded to thread pool via asyncio.to_thread
-            — prevents blocking other activities' I/O on the event loop
+    ├── Stage 2: Parse all fetched XMLs ──────────────────────► xml-feed-parse-queue (5 workers)
+    │      parse_records(task_id, raw_xml, job_id) → records stored in DB
+    │
+    └── Stage 3: Summarize all parsed records ────────────────► xml-feed-summarize-queue (5 workers)
+           summarize_records(task_id, job_id) → summaries generated, task marked complete
 ```
 
-- **Feed-level**: all URLs dispatched concurrently via Temporal `asyncio.gather`
-- **Article-level**: within a feed, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
-- **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory
+- **Feed-level**: 3-stage pipeline — all URLs fetch in parallel, then all parse in parallel, then all summarize in parallel
+- **Each stage has its own dedicated task queue with 5 workers** for independent scaling
+- **Article-level**: within a feed's parse stage, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
+- **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory using `async with` (FastAPI-style) — auto-closes on exit, auto-rollbacks on error
 - **Shared aiohttp session** — long-lived `ClientSession` reused across all activities
-- **Thread pool for CPU-bound work** — I/O is asyncio-based; CPU-bound summarization (TextRank/TF-IDF/LSA) is offloaded via `asyncio.to_thread` so it doesn't block other activities' I/O
-- **Worker dispatch** — max ~200 concurrent activities; beyond that Temporal queues server-side
+- **No thread pool** — each stage's 5 workers provide the parallelism; no need for `asyncio.to_thread`
+- **Worker dispatch** — 1 workflow worker + 5 fetch + 5 parse + 5 summarize = 16 workers total
 
 ### Failure Analysis
 
@@ -204,16 +198,16 @@ Worker (non-deterministic)
 
 | Current Choice                            | Why                                | What I'd Change                                                                             |
 |-------------------------------------------|------------------------------------|---------------------------------------------------------------------------------------------|
-| `asyncio.gather` on all URLs at once      | Simplest for 100 URLs              | **Semaphore-bounded gather** — dispatch N at a time                                         |
-| Single Temporal worker                    | Simple container                   | **Multiple replicas** + process pool for CPU-bound work                                     |
-| CPU-bound summarization via `asyncio.to_thread` | Avoids blocking event loop         | **Process pool** or push to separate async LLM service                                      |
+| 3-stage pipeline (fetch → parse → summarize) | Independent scaling per stage      | **Semaphore-bounded dispatch** per stage if 10K+ URLs                                      |
+| 5 workers per activity queue              | Balanced I/O + CPU for 100 URLs    | **Auto-scaling worker pools** based on queue depth                                          |
+| Synchronous summarization in worker       | Each worker has own event loop     | **Process pool** or push to separate async LLM service                                      |
 | `postgresql+asyncpg` per-activity session | Fixes concurrency                  | **SQLAlchemy 2.0 async** + write-through Redis cache                                        |
 | Docker Compose single-host                | Easy local dev                     | **Kubernetes** for multi-worker, auto-scaling                                               |
 | No progress reporting                     | `describe_workflow` only           | **WebSocket/SSE** + Redis pub/sub for real-time progress                                    |
 | All-or-nothing job model                  | Workflow waits for all             | **Incremental completion** — return partial results as they arrive                          |
 | feedparser + sumy                         | Works, zero cost                   | **LLM-based extraction+summarization** (OpenAI, Claude, Ollama)                             |
 | No task deduplication                     | Same URL = duplicate work          | **URL content-addressed dedup** (hash → TTL check)                                          |
-| Per-request API sessions                  | `get_db_repos()` per endpoint      | **FastAPI `Depends()`** for automatic session lifecycle                                     |
+| `async with` session lifecycle            | FastAPI-style, auto-close/rollback | **FastAPI `Depends()`** for automatic session lifecycle                                     |
 
 ## Future Extensions
 

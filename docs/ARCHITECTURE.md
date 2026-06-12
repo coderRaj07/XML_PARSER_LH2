@@ -6,22 +6,29 @@
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 │   FastAPI    │────►│   Temporal   │────►│  PostgreSQL │
 │  (port 8000) │     │  (port 7233) │     │  (port 5432)│
-└──────┬───────┘     └──────┬───────┘     └─────────────┘
-       │                    │                     ▲
-       │              ┌─────▼───────┐             │
-       │              │   Worker    │─────────────┘
-       │              │ (activities)│  (DB commits)
-       │              └─────┬───────┘
-       │                    │
-       │              ┌─────▼───────┐
-       │              │  aiohttp    │
-       │              │  (fetcher)  │
-       │              └─────┬───────┘
-       │                    │
-       │              ┌─────▼───────┐
-       │              │   External  │
-       └──────────────│  RSS Feeds  │
-                      └─────────────┘
+└──────────────┘     └──────┬───────┘     └─────────────┘
+                            │
+                    ┌───────┴────────┐
+                    │ Workflow Worker│
+                    │ (1 instance)   │
+                    └───────┬────────┘
+                            │
+          ┌─────────────────┼─────────────────┐
+          │                 │                  │
+  ┌───────▼────────┐ ┌──────▼────────┐ ┌──────▼────────┐
+  │  Fetch Queue   │ │  Parse Queue  │ │  Summarize Q  │
+  │ (5 workers)    │ │ (5 workers)   │ │ (5 workers)   │
+  └───────┬────────┘ └──────┬────────┘ └──────┬────────┘
+          │                 │                  │
+    ┌─────▼───────┐   ┌─────▼───────┐   ┌─────▼───────┐
+    │  aiohttp    │   │  Postgres   │   │  sumy       │
+    │  (fetcher)  │   │  (records)  │   │ (summaries) │
+    └─────┬───────┘   └─────────────┘   └─────────────┘
+          │
+    ┌─────▼───────┐
+    │   External  │
+    │  RSS Feeds  │
+    └─────────────┘
 ```
 
 ## Layer Architecture (Clean Architecture)
@@ -47,21 +54,38 @@
 
 ## Concurrency Model
 
-### Feed-Level: Temporal Workflow Fan-Out
+### Feed-Level: 3-Stage Pipeline with Dedicated Queues
 
 ```
-┌──────────────────────────────────────────────────┐
-│  JobWorkflow.run(job_id, tasks)                   │
-│                                                    │
-│  asyncio.gather(                                   │
-│    execute_activity("process_url", task1, url1),   │
-│    execute_activity("process_url", task2, url2),   │
-│    ...  ← all dispatched concurrently             │
-│  )                                                 │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  JobWorkflow.run(job_id, tasks)                           │
+│                                                            │
+│  Stage 1: Fetch all URLs (xml-feed-fetch-queue)           │
+│    asyncio.gather(                                         │
+│      execute_activity("fetch_url", t1, u1, j1),           │
+│      execute_activity("fetch_url", t2, u2, j2),           │
+│      ...                                                   │
+│    )                                                       │
+│                                                            │
+│  Stage 2: Parse all successfully fetched XMLs              │
+│           (xml-feed-parse-queue)                           │
+│    asyncio.gather(                                         │
+│      execute_activity("parse_records", t1, raw_xml1, j1), │
+│      execute_activity("parse_records", t2, raw_xml2, j2), │
+│      ...                                                   │
+│    )                                                       │
+│                                                            │
+│  Stage 3: Summarize all parsed records                     │
+│           (xml-feed-summarize-queue)                       │
+│    asyncio.gather(                                         │
+│      execute_activity("summarize_records", t1, j1),       │
+│      execute_activity("summarize_records", t2, j2),       │
+│      ...                                                   │
+│    )                                                       │
+└──────────────────────────────────────────────────────────┘
 ```
 
-All feed URLs are dispatched concurrently via `asyncio.gather`. The Temporal worker processes up to `max_concurrent_activities` (default 100) at once.
+Each stage uses a separate task queue with 5 dedicated workers. Failed tasks at any stage are filtered out of subsequent stages.
 
 ### Article-Level: Per-Domain Concurrency
 
@@ -83,15 +107,32 @@ _fetch_full_contents(records=[r1, r2, r3, r4, ...])
 - **Same domain**: up to 2 concurrent with 1s gap between start times
 - **Config**: `CONCURRENT_PER_DOMAIN = 2`, throttle = 1.0s
 
-### Activity-Level: Per-Activity DB Sessions
+### Activity-Level: Per-Activity DB Sessions (FastAPI-style)
 
 ```
-Worker
-  ├── Activity 1: session₁ → fetch RSS → parse → fetch_full_contents → store → summarize → commit
-  ├── Activity 2: session₂ → fetch RSS → parse → fetch_full_contents → store → summarize → commit
-  └── Activity N: sessionₙ → ...
-       Each activity gets a fresh AsyncSession from the pool (pool_size=10, max_overflow=20 → 30 conns/worker)
-       At scale: 30 conns × N workers can exceed Postgres limits; use PgBouncer or reduce per-worker pool size
+FetchActivity (fetch-queue)
+  └── async with session_factory() as session:
+        fetcher.fetch(url) → raw_xml
+        (no DB needed unless error — then task marked failed)
+
+ParseActivity (parse-queue)
+  └── async with session_factory() as session:
+        parser.parse(raw_xml) → records
+        fetch_full_contents(records)  ← concurrent per-domain
+        record_repo.create_many(records)
+        session.commit()
+
+SummarizeActivity (summarize-queue)
+  └── async with session_factory() as session:
+        record_repo.list_by_task(task_id) → records
+        for each record: generate_summary → save_summary
+        task.mark_completed() → task_repo.update()
+        job.update_progress() → job_repo.update()
+        session.commit()
+
+Each activity gets a fresh AsyncSession from the pool, managed via
+`async with session_factory() as session:` — auto-closes on exit,
+auto-rollbacks on exception (FastAPI-style lifecycle).
 ```
 
 ## Data Flow
@@ -106,24 +147,40 @@ Create Job + Tasks in DB
 Start Temporal Workflow (JobWorkflow)
   │
   ▼
-asyncio.gather(all tasks)
+Stage 1 — Fetch Queue (5 workers)
+  │  asyncio.gather(all tasks)
+  │  ├──► fetch_url(task_id, url, job_id)
+  │  │      └── aiohttp.get(url) → raw_xml
+  │  └──► ... (repeat for each URL)
   │
-  ├──► Activity: process_url(task_id, url, job_id)
-  │      │
-  │      ├── 1. Fetch RSS XML (aiohttp)
-  │      ├── 2. Parse XML → Records (feedparser)
-  │      ├── 3. Truncate to max_articles=20
-  │      ├── 4. Fetch full article content (trafilatura) ← CONCURRENT
-  │      │      - Gzip-compress full_content
-  │      ├── 5. Store Records in DB
-  │      └── 6. Generate Summaries (TextRank + TF-IDF + LSA)
+  ▼
+Stage 2 — Parse Queue (5 workers)
+  │  asyncio.gather(successful fetches)
+  │  ├──► parse_records(task_id, raw_xml, job_id)
+  │  │      ├── feedparser.parse(raw_xml) → records
+  │  │      ├── Truncate to max_articles=10
+  │  │      ├── Fetch full article content ← CONCURRENT per-domain
+  │  │      │      (trafilatura, gzip-compress full_content)
+  │  │      └── Store records in DB → session.commit()
+  │  └──► ... (repeat for each successful fetch)
   │
-  └──► ... (repeat for each URL)
-
-Worker commits DB session → Job progress updated
+  ▼
+Stage 3 — Summarize Queue (5 workers)
+  │  asyncio.gather(successful parses)
+  │  ├──► summarize_records(task_id, job_id)
+  │  │      ├── list records by task_id from DB
+  │  │      ├── generate summaries (TextRank + TF-IDF + LSA)
+  │  │      ├── mark task completed
+  │  │      └── update job progress → session.commit()
+  │  └──► ... (repeat for each successful parse)
 ```
 
 ## Key Decisions
+
+### Why 3 separate queues?
+- **Independent scaling**: fetch (I/O-bound), parse (I/O + CPU), summarize (CPU-bound) each have 5 dedicated workers
+- **Isolation**: a fetch backlog doesn't starve summarize workers; each stage can be tuned independently
+- **Pipeline efficiency**: all fetches complete before parsing starts, preventing partial work
 
 ### Why Temporal?
 - Durable execution with built-in retry + backoff
@@ -142,10 +199,10 @@ Worker commits DB session → Job progress updated
 - More reliable than readability-lxml for diverse sites
 - Python-native, no external service dependency
 
-### Why per-activity DB sessions?
-- Avoids session contention across concurrent activities
-- Each activity commits independently (partial success)
-- Rollback scope is per-activity, not per-job
+### Why async context manager for sessions?
+- **FastAPI-style lifecycle**: `async with session_factory() as session:` — auto-closes on exit, auto-rollbacks on error
+- **No manual cleanup**: eliminates `try/finally { close() }` boilerplate
+- **Consistent across API + workers**: same pattern in controllers and Temporal activities
 
 ## Fetcher Design
 

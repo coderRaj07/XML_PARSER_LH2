@@ -2,7 +2,18 @@
 
 ## How many workers are we using?
 
-**One Temporal worker.** A single `worker` container (defined in `docker-compose.yml:65`) runs the activity worker that processes all feed URLs. The DB connection pool is `pool_size=10` with `max_overflow=20` — up to **30 concurrent connections per worker** (see [PgBouncer section](#why-does-each-worker-consume-30-db-connections-what-is-pgbouncer) for the math at scale). The aiohttp connector allows `limit=100` total connections with `limit_per_host=2`.
+**16 Temporal workers total.** The system runs:
+
+| Queue | Workers | Role |
+|-------|---------|------|
+| `xml-feed-workflow-queue` | 1 | Orchestrates the 3-stage pipeline |
+| `xml-feed-fetch-queue` | 5 | Fetches RSS/XML URLs (I/O-bound) |
+| `xml-feed-parse-queue` | 5 | Parses XML, fetches article content, stores records (I/O + CPU) |
+| `xml-feed-summarize-queue` | 5 | Generates summaries, updates task/job status (CPU-bound) |
+
+This gives **independent scaling per stage** — a fetch backlog won't starve summarize workers.
+
+The DB connection pool is `pool_size=30` with `max_overflow=60` — up to **90 concurrent connections per worker pod** (see [PgBouncer section](#why-does-each-worker-consume-30-db-connections-what-is-pgbouncer) for the math at scale). The aiohttp connector allows `limit=100` total connections with `limit_per_host=2`.
 
 ---
 
@@ -99,6 +110,14 @@ Already handled by `_is_garbage()` detection — content under 50 chars is skipp
 
 ---
 
+### ✅ 6. Removed `asyncio.to_thread` (no thread pool needed)
+
+With 5 dedicated workers per queue, each running its own event loop, the `asyncio.to_thread` offloading is redundant. The synchronous `generate_summary()` call now runs directly in the summarize worker's event loop — blocking that worker briefly doesn't affect other stages since each has its own pool.
+
+**Impact:** Simpler code, same throughput, no thread pool management overhead.
+
+---
+
 ## Why does each worker consume 30 DB connections? What is PgBouncer?
 
 **The math:** `src/infrastructure/db/session.py:16` sets `pool_size=10, max_overflow=20` = up to **30 concurrent DB connections per worker**. Each activity borrows a session from the pool; if all 30 are in use, subsequent activities queue up.
@@ -132,7 +151,7 @@ Worker 101 ┘
 
 ## What about CPU-bound summarization?
 
-The `TextRank + TF-IDF + LSA` summarization runs via `asyncio.to_thread()` which offloads it to a thread pool. This prevents blocking the event loop, but each article summarization still consumes CPU. The main mitigation is **reducing `max_articles`** and **scaling workers** (each worker has its own thread pool).
+`TextRank + TF-IDF + LSA` summarization runs synchronously inside the summarize worker's event loop. With **5 dedicated summarize workers**, each blocking briefly on CPU-bound work is acceptable — the 5-way parallelism at the queue level replaces the need for a thread pool. The main mitigation is **reducing `max_articles`** and **scaling summarize workers** independently.
 
 ---
 
@@ -146,8 +165,8 @@ If you know certain URLs will always fail (e.g., specific deleted YouTube channe
 
 | Metric | Before | After (expected) |
 |--------|--------|------------------|
-| 101 URLs, 1 worker | ~10-15 min | ~6-8 min |
-| 101 URLs, 5 workers | N/A | ~2-3 min |
+| 101 URLs, 1 workflow + 15 activity workers | ~10-15 min | ~2-3 min |
 | YouTube URL failure time | ~3-5s each | ~1-2s each |
-| DB connections per worker | 30 max | 90 max |
+| DB connections per worker pod | 30 max | 90 max |
 | Articles processed per feed | 20 | 10 |
+| Thread pool | `asyncio.to_thread` used | Removed (5 workers per queue) |
