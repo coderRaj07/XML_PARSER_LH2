@@ -9,6 +9,7 @@ with workflow.unsafe.imports_passed_through():
     pass
 
 WORKFLOW_NAME = "job-workflow"
+WORKFLOW_QUEUE = "xml-feed-workflow-queue"
 FETCH_QUEUE = "xml-feed-fetch-queue"
 PARSE_QUEUE = "xml-feed-parse-queue"
 SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
