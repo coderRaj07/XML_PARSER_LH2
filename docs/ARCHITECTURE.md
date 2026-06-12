@@ -10,14 +10,14 @@
                             │
                     ┌───────┴────────┐
                     │ Workflow Worker│
-                    │ (1 instance)   │
+                    │ (1 process)    │
                     └───────┬────────┘
                             │
           ┌─────────────────┼─────────────────┐
           │                 │                  │
   ┌───────▼────────┐ ┌──────▼────────┐ ┌──────▼────────┐
-  │  Fetch Queue   │ │  Parse Queue  │ │  Summarize Q  │
-  │ (5 workers)    │ │ (5 workers)   │ │ (5 workers)   │
+  │  Fetch Worker  │ │  Parse Worker │ │Summarize Worker│
+  │ (own process)  │ │ (own process) │ │ (own process)  │
   └───────┬────────┘ └──────┬────────┘ └──────┬────────┘
           │                 │                  │
     ┌─────▼───────┐   ┌─────▼───────┐   ┌─────▼───────┐
@@ -60,32 +60,21 @@
 ┌──────────────────────────────────────────────────────────┐
 │  JobWorkflow.run(job_id, tasks)                           │
 │                                                            │
-│  Stage 1: Fetch all URLs (xml-feed-fetch-queue)           │
+│  For each batch of BATCH_SIZE URLs:                       │
 │    asyncio.gather(                                         │
-│      execute_activity("fetch_url", t1, u1, j1),           │
-│      execute_activity("fetch_url", t2, u2, j2),           │
+│      _process_url(t1, u1, j1)  ──► fetch ──► parse ──► summarize
+│      _process_url(t2, u2, j2)  ──► fetch ──► parse ──► summarize
 │      ...                                                   │
 │    )                                                       │
 │                                                            │
-│  Stage 2: Parse all successfully fetched XMLs              │
-│           (xml-feed-parse-queue)                           │
-│    asyncio.gather(                                         │
-│      execute_activity("parse_records", t1, raw_xml1, j1), │
-│      execute_activity("parse_records", t2, raw_xml2, j2), │
-│      ...                                                   │
-│    )                                                       │
-│                                                            │
-│  Stage 3: Summarize all parsed records                     │
-│           (xml-feed-summarize-queue)                       │
-│    asyncio.gather(                                         │
-│      execute_activity("summarize_records", t1, j1),       │
-│      execute_activity("summarize_records", t2, j2),       │
-│      ...                                                   │
-│    )                                                       │
+│  Each URL runs independently through all 3 stages:        │
+│    fetch_url  ──► xml-feed-fetch-queue (own process)      │
+│    parse_records ──► xml-feed-parse-queue (own process)   │
+│    summarize_records ──► xml-feed-summarize-queue (own)   │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Each stage uses a separate task queue with 5 dedicated workers. Failed tasks at any stage are filtered out of subsequent stages.
+Each queue runs in its own Docker container (OS process) for true CPU parallelism. Failed tasks at any stage are caught and returned as failures without blocking other URLs.
 
 ### Article-Level: Per-Domain Concurrency
 
@@ -147,15 +136,15 @@ Create Job + Tasks in DB
 Start Temporal Workflow (JobWorkflow)
   │
   ▼
-Stage 1 — Fetch Queue (5 workers)
-  │  asyncio.gather(all tasks)
+Stage 1 — Fetch Queue (own process)
+  │  asyncio.gather(all tasks in batch)
   │  ├──► fetch_url(task_id, url, job_id)
   │  │      └── aiohttp.get(url) → raw_xml
   │  └──► ... (repeat for each URL)
   │
   ▼
-Stage 2 — Parse Queue (5 workers)
-  │  asyncio.gather(successful fetches)
+Stage 2 — Parse Queue (own process)
+  │  asyncio.gather(successful fetches in batch)
   │  ├──► parse_records(task_id, raw_xml, job_id)
   │  │      ├── feedparser.parse(raw_xml) → records
   │  │      ├── Truncate to max_articles=10
@@ -165,8 +154,8 @@ Stage 2 — Parse Queue (5 workers)
   │  └──► ... (repeat for each successful fetch)
   │
   ▼
-Stage 3 — Summarize Queue (5 workers)
-  │  asyncio.gather(successful parses)
+Stage 3 — Summarize Queue (own process)
+  │  asyncio.gather(successful parses in batch)
   │  ├──► summarize_records(task_id, job_id)
   │  │      ├── list records by task_id from DB
   │  │      ├── generate summaries (TextRank + TF-IDF + LSA)
@@ -178,9 +167,9 @@ Stage 3 — Summarize Queue (5 workers)
 ## Key Decisions
 
 ### Why 3 separate queues?
-- **Independent scaling**: fetch (I/O-bound), parse (I/O + CPU), summarize (CPU-bound) each have 5 dedicated workers
+- **Independent scaling**: fetch (I/O-bound), parse (I/O + CPU), summarize (CPU-bound) each run as separate OS processes, independently scalable via `docker compose --scale`
 - **Isolation**: a fetch backlog doesn't starve summarize workers; each stage can be tuned independently
-- **Pipeline efficiency**: all fetches complete before parsing starts, preventing partial work
+- **No thread pools**: each process has its own event loop — blocking CPU calls don't stall other queues
 
 ### Why Temporal?
 - Durable execution with built-in retry + backoff
@@ -263,7 +252,7 @@ Session: aiohttp.ClientSession
 | Expected with all fixes | 79/101 |
 | Total time (1 worker, max_articles=20) | ~10-15 min |
 | Total time (1 worker, max_articles=10) | ~6-8 min |
-| Total time (5 workers, max_articles=10) | ~2-3 min |
+| Total time (scaled, max_articles=10) | ~2-3 min |
 | Bottleneck | Article-level HTTP fetching + summarization |
 
 ## Failure Analysis

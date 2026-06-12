@@ -16,7 +16,7 @@ Production-grade backend for ingesting RSS/XML feeds, extracting records, and ge
 docker compose up --build -d
 
 # Follow worker logs to monitor processing
-docker compose logs -f worker
+docker compose logs -f workflow-worker fetch-worker parse-worker summarize-worker
 
 # API available at 
 http://localhost:8000
@@ -40,14 +40,14 @@ curl "http://localhost:8000/jobs/{job_id}/records?limit=5"
 ##### Run with multiple workers (faster)
 
 ```bash
-# Scale to 5 worker replicas after services are up
-docker compose up -d --scale worker=5
+# Scale each queue independently (3 fetch + 2 parse + 2 summarize = 7 containers)
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
 
-# Verify all workers are running
-docker compose ps worker
+# Verify workers are running
+docker compose ps
 
 # Monitor all worker logs
-docker compose logs -f worker
+docker compose logs -f fetch-worker parse-worker summarize-worker
 
 # Expected improvement: ~10 min → ~2-3 min for 101 URLs
 ```
@@ -68,8 +68,11 @@ docker compose up postgres temporal -d
 # 4. Start the application
 uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 
-# 5. Start the Temporal Worker (separate terminal)
-python -m src.infrastructure.temporal.run_worker
+# 5. Start Temporal Workers (separate terminals — one per queue)
+QUEUE=workflow python -m src.infrastructure.temporal.run_worker
+QUEUE=fetch    python -m src.infrastructure.temporal.run_worker
+QUEUE=parse    python -m src.infrastructure.temporal.run_worker
+QUEUE=summarize python -m src.infrastructure.temporal.run_worker
 ```
 
 ### Run tests
@@ -132,23 +135,23 @@ The system is built around **Temporal + asyncio** for concurrency rather than Ce
 ```
 Workflow (deterministic)
     │
-    ├── Stage 1: Fetch all URLs ──────────────────────────────► xml-feed-fetch-queue (5 workers)
+    ├── Stage 1: Fetch all URLs ──────────────────────────────► xml-feed-fetch-queue (container per process)
     │      fetch_url(task_id, url, job_id) → raw_xml
     │
-    ├── Stage 2: Parse all fetched XMLs ──────────────────────► xml-feed-parse-queue (5 workers)
+    ├── Stage 2: Parse all fetched XMLs ──────────────────────► xml-feed-parse-queue (container per process)
     │      parse_records(task_id, raw_xml, job_id) → records stored in DB
     │
-    └── Stage 3: Summarize all parsed records ────────────────► xml-feed-summarize-queue (5 workers)
+    └── Stage 3: Summarize all parsed records ────────────────► xml-feed-summarize-queue (container per process)
            summarize_records(task_id, job_id) → summaries generated, task marked complete
 ```
 
-- **Feed-level**: 3-stage pipeline — all URLs fetch in parallel, then all parse in parallel, then all summarize in parallel
-- **Each stage has its own dedicated task queue with 5 workers** for independent scaling
+- **Feed-level**: URLs process independently through all 3 stages (fetch → parse → summarize) — each URL progresses without waiting for others at the same stage
+- **Each queue runs in its own OS process** — true CPU parallelism across all 4 containers (workflow + fetch + parse + summarize)
+- **No thread pools** — each process has its own event loop; blocking CPU calls (`trafilatura.extract`, `generate_summary`) don't stall other queues
+- **Scale per queue** — `docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2`
 - **Article-level**: within a feed's parse stage, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
 - **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory using `async with` (FastAPI-style) — auto-closes on exit, auto-rollbacks on error
 - **Shared aiohttp session** — long-lived `ClientSession` reused across all activities
-- **No thread pool** — each stage's 5 workers provide the parallelism; no need for `asyncio.to_thread`
-- **Worker dispatch** — 1 workflow worker + 5 fetch + 5 parse + 5 summarize = 16 workers total
 
 ### Failure Analysis
 
@@ -186,7 +189,7 @@ Workflow (deterministic)
 | Bottleneck                   | Fix                                                                                                    |
 |------------------------------|--------------------------------------------------------------------------------------------------------|
 | 🔌 DB pool                   | Increase `pool_size=100`, PgBouncer, or RDS Proxy                                                      |
-| ⚙️ Worker concurrency        | `docker compose scale worker=10` — each polls same task queue                                          |
+| ⚙️ Worker concurrency        | `docker compose --scale fetch-worker=5 --scale parse-worker=5 --scale summarize-worker=5` |
 | 💻 Summarization CPU         | Offload to process pool or async LLM API (OpenAI, Claude, Ollama)                                      |
 | 🗄️ DB writes                | Batch INSERTs; use COPY for bulk loads                                                                 |
 | 🌐 HTTP connections          | Increase connector limit; keep-alive; DNS cache; HTTP/2 multiplexing                                   |
@@ -199,7 +202,7 @@ Workflow (deterministic)
 | Current Choice                            | Why                                | What I'd Change                                                                             |
 |-------------------------------------------|------------------------------------|---------------------------------------------------------------------------------------------|
 | 3-stage pipeline (fetch → parse → summarize) | Independent scaling per stage      | **Semaphore-bounded dispatch** per stage if 10K+ URLs                                      |
-| 5 workers per activity queue              | Balanced I/O + CPU for 100 URLs    | **Auto-scaling worker pools** based on queue depth                                          |
+| Per-process queue workers                 | True CPU parallelism, no GIL       | **Auto-scaling worker pools** based on queue depth                                          |
 | Synchronous summarization in worker       | Each worker has own event loop     | **Process pool** or push to separate async LLM service                                      |
 | `postgresql+asyncpg` per-activity session | Fixes concurrency                  | **SQLAlchemy 2.0 async** + write-through Redis cache                                        |
 | Docker Compose single-host                | Easy local dev                     | **Kubernetes** for multi-worker, auto-scaling                                               |

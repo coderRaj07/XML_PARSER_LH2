@@ -2,16 +2,21 @@
 
 ## How many workers are we using?
 
-**16 Temporal workers total.** The system runs:
+**4 processes, each with `max_concurrent_activities=5`.** Each queue runs in its own Docker container with its own OS process and event loop:
 
-| Queue | Workers | Role |
+| Queue | Process | Role |
 |-------|---------|------|
-| `xml-feed-workflow-queue` | 1 | Orchestrates the 3-stage pipeline |
-| `xml-feed-fetch-queue` | 5 | Fetches RSS/XML URLs (I/O-bound) |
-| `xml-feed-parse-queue` | 5 | Parses XML, fetches article content, stores records (I/O + CPU) |
-| `xml-feed-summarize-queue` | 5 | Generates summaries, updates task/job status (CPU-bound) |
+| `xml-feed-workflow-queue` | 1 `workflow-worker` container | Orchestrates the 3-stage pipeline (deterministic) |
+| `xml-feed-fetch-queue` | N `fetch-worker` containers | Fetches RSS/XML URLs (I/O-bound) |
+| `xml-feed-parse-queue` | N `parse-worker` containers | Parses XML, fetches article content, stores records (I/O + CPU) |
+| `xml-feed-summarize-queue` | N `summarize-worker` containers | Generates summaries, updates task/job status (CPU-bound) |
 
-This gives **independent scaling per stage** — a fetch backlog won't starve summarize workers.
+Each worker runs `max_concurrent_activities=5` (configurable via `FETCH_WORKERS`, `PARSE_WORKERS`, `SUMMARIZE_WORKERS` env vars).
+
+This gives **independent scaling per stage** — a fetch backlog won't starve summarize workers, and each stage can be scaled to its own bottleneck:
+```bash
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
+```
 
 The DB connection pool is `pool_size=30` with `max_overflow=60` — up to **90 concurrent connections per worker pod** (see [PgBouncer section](#why-does-each-worker-consume-30-db-connections-what-is-pgbouncer) for the math at scale). The aiohttp connector allows `limit=100` total connections with `limit_per_host=2`.
 
@@ -38,9 +43,9 @@ Permanent failures (`RuntimeError("Permanent failure HTTP 404...")`) are now cau
 | Bottleneck | Time | Why |
 |------------|------|-----|
 | Article content fetching | ~12-20s per feed | 20 articles × per-domain Semaphore(2) + 1s throttle |
-| CPU-bound summarization | ~2-5s per article | TextRank + TF-IDF + LSA via `asyncio.to_thread` |
+| CPU-bound summarization | ~2-5s per article | TextRank + TF-IDF + LSA |
 | YouTube 404 failures | ~3-5s per URL | Network round-trip + 3 retries |
-| Single worker | N/A | All 101 tasks compete for 1 worker's DB pool (30 conns) |
+| Single worker concurrency | N/A | Only 5 concurrent activities per queue process |
 
 **Total for 101 feeds:** ~10-15 minutes.
 
@@ -68,17 +73,16 @@ With a single worker processing up to 200 concurrent activities (Temporal defaul
 
 ---
 
-### ✅ 3. Scale Temporal workers
+### ✅ 3. Scale worker processes per queue
 
-Instead of 1 worker, run multiple worker containers. Each worker picks up activities from the same task queue and processes them concurrently.
+Instead of 1 process per queue, run multiple containers per queue. Each container is a separate OS process with its own event loop — true CPU parallelism without thread pools.
 
 ```bash
-docker compose up -d --scale worker=5
+# Scale fetch to 3, parse to 2, summarize to 2
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
 ```
 
-**Change:** `docker-compose.yml` — added comments with scaling instructions.
-
-**Impact:** Near-linear speedup for I/O-bound work. 5 workers = ~2-3 min total.
+**Impact:** Near-linear speedup for I/O-bound work. 3 fetch + 2 parse + 2 summarize = ~2-3 min total.
 
 ---
 
@@ -110,11 +114,11 @@ Already handled by `_is_garbage()` detection — content under 50 chars is skipp
 
 ---
 
-### ✅ 6. Removed `asyncio.to_thread` (no thread pool needed)
+### 6. No thread pool needed — each queue is its own process
 
-With 5 dedicated workers per queue, each running its own event loop, the `asyncio.to_thread` offloading is redundant. The synchronous `generate_summary()` call now runs directly in the summarize worker's event loop — blocking that worker briefly doesn't affect other stages since each has its own pool.
+With each queue running in its own OS process, blocking CPU calls (`trafilatura.extract`, `generate_summary`) don't stall other queues. Each process has its own event loop and runs independently.
 
-**Impact:** Simpler code, same throughput, no thread pool management overhead.
+**Impact:** Simpler code, true parallelism, no GIL contention between queues, no thread pool management overhead.
 
 ---
 
@@ -151,7 +155,7 @@ Worker 101 ┘
 
 ## What about CPU-bound summarization?
 
-`TextRank + TF-IDF + LSA` summarization runs synchronously inside the summarize worker's event loop. With **5 dedicated summarize workers**, each blocking briefly on CPU-bound work is acceptable — the 5-way parallelism at the queue level replaces the need for a thread pool. The main mitigation is **reducing `max_articles`** and **scaling summarize workers** independently.
+`TextRank + TF-IDF + LSA` summarization runs synchronously inside the summarize worker's event loop. Since each queue is its own **OS process**, a blocking CPU call in summarize doesn't affect fetch or parse workers. The main mitigation is **reducing `max_articles`** and **scaling summarize workers** independently with `--scale summarize-worker=N`.
 
 ---
 
@@ -165,8 +169,8 @@ If you know certain URLs will always fail (e.g., specific deleted YouTube channe
 
 | Metric | Before | After (expected) |
 |--------|--------|------------------|
-| 101 URLs, 1 workflow + 15 activity workers | ~10-15 min | ~2-3 min |
+| 101 URLs, 1 process per queue | ~10-15 min | ~2-3 min |
 | YouTube URL failure time | ~3-5s each | ~1-2s each |
 | DB connections per worker pod | 30 max | 90 max |
 | Articles processed per feed | 20 | 10 |
-| Thread pool | `asyncio.to_thread` used | Removed (5 workers per queue) |
+| Thread pool | `asyncio.to_thread` used | None needed (per-process isolation) |

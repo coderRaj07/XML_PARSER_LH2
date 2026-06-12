@@ -25,68 +25,61 @@ from src.infrastructure.temporal.workflows import (
 logger = logging.getLogger(__name__)
 
 
-async def run_workers(
+async def run_queue_worker(
     temporal_host: str,
     session_factory: async_sessionmaker[AsyncSession],
     fetcher: Fetcher,
     parser: ParserStrategy,
     summary_service: SummaryService,
+    queue: str,
 ) -> None:
     client = await Client.connect(temporal_host)
 
-    fetch_activity = FetchActivity(
-        session_factory=session_factory,
-        fetcher=fetcher,
-    )
-    parse_activity = ParseActivity(
-        session_factory=session_factory,
-        parser=parser,
-        fetcher=fetcher,
-    )
-    summarize_activity = SummarizeActivity(
-        session_factory=session_factory,
-        summary_service=summary_service,
-    )
+    if queue == "workflow":
+        w = Worker(
+            client=client,
+            task_queue=WORKFLOW_QUEUE,
+            workflows=[JobWorkflow],
+        )
+        worker_task = asyncio.create_task(w.run())
+        logger.info("Workflow worker started", extra={"task_queue": WORKFLOW_QUEUE})
+        await worker_task
 
-    worker_tasks: list[asyncio.Task[None]] = []
+    elif queue == "fetch":
+        activity = FetchActivity(session_factory=session_factory, fetcher=fetcher)
+        w = Worker(
+            client=client,
+            task_queue=FETCH_QUEUE,
+            activities=[activity.fetch_url],
+            max_concurrent_activities=FETCH_WORKER_COUNT,
+        )
+        worker_task = asyncio.create_task(w.run())
+        logger.info("Fetch worker started", extra={"task_queue": FETCH_QUEUE, "max_concurrent": FETCH_WORKER_COUNT})
+        await worker_task
 
-    workflow_worker = Worker(
-        client=client,
-        task_queue=WORKFLOW_QUEUE,
-        workflows=[JobWorkflow],
-    )
-    worker_tasks.append(asyncio.create_task(workflow_worker.run()))
-    logger.info("Workflow worker created", extra={"task_queue": WORKFLOW_QUEUE})
+    elif queue == "parse":
+        activity = ParseActivity(session_factory=session_factory, parser=parser, fetcher=fetcher)
+        w = Worker(
+            client=client,
+            task_queue=PARSE_QUEUE,
+            activities=[activity.parse_records],
+            max_concurrent_activities=PARSE_WORKER_COUNT,
+        )
+        worker_task = asyncio.create_task(w.run())
+        logger.info("Parse worker started", extra={"task_queue": PARSE_QUEUE, "max_concurrent": PARSE_WORKER_COUNT})
+        await worker_task
 
-    w = Worker(
-        client=client,
-        task_queue=FETCH_QUEUE,
-        activities=[fetch_activity.fetch_url],
-        max_concurrent_activities=FETCH_WORKER_COUNT,
-    )
-    worker_tasks.append(asyncio.create_task(w.run()))
-    logger.info("Fetch worker created", extra={"max_concurrent": FETCH_WORKER_COUNT, "task_queue": FETCH_QUEUE})
+    elif queue == "summarize":
+        activity = SummarizeActivity(session_factory=session_factory, summary_service=summary_service)
+        w = Worker(
+            client=client,
+            task_queue=SUMMARIZE_QUEUE,
+            activities=[activity.summarize_records],
+            max_concurrent_activities=SUMMARIZE_WORKER_COUNT,
+        )
+        worker_task = asyncio.create_task(w.run())
+        logger.info("Summarize worker started", extra={"task_queue": SUMMARIZE_QUEUE, "max_concurrent": SUMMARIZE_WORKER_COUNT})
+        await worker_task
 
-    w = Worker(
-        client=client,
-        task_queue=PARSE_QUEUE,
-        activities=[parse_activity.parse_records],
-        max_concurrent_activities=PARSE_WORKER_COUNT,
-    )
-    worker_tasks.append(asyncio.create_task(w.run()))
-    logger.info("Parse worker created", extra={"max_concurrent": PARSE_WORKER_COUNT, "task_queue": PARSE_QUEUE})
-
-    w = Worker(
-        client=client,
-        task_queue=SUMMARIZE_QUEUE,
-        activities=[summarize_activity.summarize_records],
-        max_concurrent_activities=SUMMARIZE_WORKER_COUNT,
-    )
-    worker_tasks.append(asyncio.create_task(w.run()))
-    logger.info("Summarize worker created", extra={"max_concurrent": SUMMARIZE_WORKER_COUNT, "task_queue": SUMMARIZE_QUEUE})
-
-    logger.info(
-        "All workers started",
-        extra={"total_workers": 1 + FETCH_WORKER_COUNT + PARSE_WORKER_COUNT + SUMMARIZE_WORKER_COUNT},
-    )
-    await asyncio.gather(*worker_tasks)
+    else:
+        raise ValueError(f"Unknown queue: {queue}. Must be one of: workflow, fetch, parse, summarize")

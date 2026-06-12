@@ -1,41 +1,46 @@
 # Quick Start
 
 ```bash
-# Build and start all services (1 worker pod is enough for most cases)
+# Build and start all services
 docker compose up --build -d
 
 # Verify everything is healthy
 docker compose ps
 
-# Follow worker logs
-docker compose logs -f worker
+# Follow all worker logs
+docker compose logs -f workflow-worker fetch-worker parse-worker summarize-worker
 ```
+
+## Architecture
+
+Each queue runs in its own OS process for true CPU parallelism:
+
+```
+workflow-worker (1 process per `--scale`)
+fetch-worker    (N processes per `--scale`)
+parse-worker    (M processes per `--scale`)
+summarize-worker (K processes per `--scale`)
+```
+
+No thread pools — each process has its own event loop, so blocking CPU calls (`trafilatura.extract`, `generate_summary`) don't stall other queues.
 
 ## Scaling
 
-A single worker pod runs **16 internal workers** by default (1 workflow + 5 fetch + 5 parse + 5 summarize) — enough for most workloads.
-
-Only scale horizontally if you need more CPU/memory:
+Scale each queue independently based on its bottleneck:
 
 ```bash
-# Scale to 5 Docker containers (80 workers total)
-docker compose up -d --scale worker=5
+# 3 fetch + 2 parse + 2 summarize = 7 worker containers
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
 ```
 
-## Tuning per-queue workers
+Each worker runs with `max_concurrent_activities=5` by default, tunable via `FETCH_WORKERS`, `PARSE_WORKERS`, `SUMMARIZE_WORKERS` env vars.
 
-Adjust workers per stage without adding containers:
+## Tuning per-queue concurrency
 
 ```bash
 # At startup:
 FETCH_WORKERS=10 PARSE_WORKERS=10 SUMMARIZE_WORKERS=10 docker compose up --build -d
 
-# Or on an already running container:
-docker compose run -e FETCH_WORKERS=10 -e PARSE_WORKERS=10 -e SUMMARIZE_WORKERS=10 worker
-```
-
-## Architecture
-
-```
-1 pod = 1 workflow + 5 fetch + 5 parse + 5 summarize = 16 workers
+# On an already running service (recreates that container):
+docker compose up -d --scale fetch-worker=5 -e FETCH_WORKERS=10
 ```

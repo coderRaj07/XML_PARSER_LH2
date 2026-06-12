@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -62,21 +60,61 @@ services:
       temporal:
         condition: service_started
 
-  # Scale workers for more throughput:
-  #   docker compose up -d --scale worker=5
-  # Each worker pod runs 16 Temporal workers by default:
-  #   1 workflow + 5 fetch + 5 parse + 5 summarize
-  # Override per-queue worker counts via env vars:
-  #   docker compose run -e FETCH_WORKERS=10 -e PARSE_WORKERS=10 -e SUMMARIZE_WORKERS=10 worker
-  worker:
+  # Each queue runs in its own process for true parallelism.
+  # Scale independently, e.g.:
+  #   docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
+  workflow-worker:
     build: .
     command: python -m src.infrastructure.temporal.run_worker
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
       TEMPORAL_HOST: temporal:7233
       LOG_LEVEL: INFO
+      QUEUE: workflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  fetch-worker:
+    build: .
+    command: python -m src.infrastructure.temporal.run_worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
+      TEMPORAL_HOST: temporal:7233
+      LOG_LEVEL: INFO
+      QUEUE: fetch
       FETCH_WORKERS: "${FETCH_WORKERS:-5}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  parse-worker:
+    build: .
+    command: python -m src.infrastructure.temporal.run_worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
+      TEMPORAL_HOST: temporal:7233
+      LOG_LEVEL: INFO
+      QUEUE: parse
       PARSE_WORKERS: "${PARSE_WORKERS:-5}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  summarize-worker:
+    build: .
+    command: python -m src.infrastructure.temporal.run_worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
+      TEMPORAL_HOST: temporal:7233
+      LOG_LEVEL: INFO
+      QUEUE: summarize
       SUMMARIZE_WORKERS: "${SUMMARIZE_WORKERS:-5}"
     depends_on:
       postgres:
