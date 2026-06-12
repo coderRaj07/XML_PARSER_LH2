@@ -41,7 +41,7 @@ class JobWorkflow:
         )
 
         if remaining:
-            workflow.continue_as_new(job_id, remaining)
+            workflow.continue_as_new(args=[job_id, remaining])
 
         completed = sum(1 for r in results if not isinstance(r, Exception) and r.get("status") == "completed")
         failed = sum(1 for r in results if isinstance(r, Exception) or r.get("status") == "failed")
