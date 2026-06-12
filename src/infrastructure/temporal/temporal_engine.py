@@ -4,8 +4,7 @@ from typing import Any
 from temporalio.client import Client
 
 from src.application.interfaces.execution_engine import ExecutionEngine
-from src.infrastructure.temporal.config import WORKFLOW_QUEUE
-from src.infrastructure.temporal.workflows import JobWorkflow
+from src.infrastructure.temporal.workflows import WORKFLOW_NAME, WORKFLOW_QUEUE
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +23,7 @@ class TemporalEngine(ExecutionEngine):
     async def start_job(self, job_id: str, tasks: list[tuple[str, str]]) -> str:
         client = await self._ensure_client()
         handle = await client.start_workflow(
-            "job-workflow",
+            WORKFLOW_NAME,
             args=[job_id, tasks],
             id=job_id,
             task_queue=self._task_queue,

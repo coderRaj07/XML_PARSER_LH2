@@ -1,18 +1,25 @@
 import asyncio
+from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from src.infrastructure.temporal.config import (
-        ACTIVITY_TIMEOUT,
-        BATCH_SIZE,
-        FETCH_QUEUE,
-        PARSE_QUEUE,
-        RETRY_POLICY,
-        SUMMARIZE_QUEUE,
-        WORKFLOW_NAME,
-    )
+    pass
+
+WORKFLOW_NAME = "job-workflow"
+FETCH_QUEUE = "xml-feed-fetch-queue"
+PARSE_QUEUE = "xml-feed-parse-queue"
+SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
+BATCH_SIZE = 50
+ACTIVITY_TIMEOUT = timedelta(minutes=5)
+RETRY_POLICY = RetryPolicy(
+    maximum_attempts=3,
+    initial_interval=timedelta(seconds=1),
+    maximum_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+)
 
 
 @workflow.defn(name=WORKFLOW_NAME)
