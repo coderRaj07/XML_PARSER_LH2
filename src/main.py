@@ -83,7 +83,8 @@ def build_container() -> None:
 
 @asynccontextmanager
 async def get_db_repos() -> AsyncGenerator[tuple[RecordRepository, JobRepository], None]:
-    async with DatabaseSessionManager.get_session_factory() as session:
+    factory = DatabaseSessionManager.get_session_factory()
+    async with factory() as session:
         record_repo: RecordRepository = PostgresRecordRepository(session)
         job_repo: JobRepository = PostgresJobRepository(session)
         yield record_repo, job_repo
@@ -91,7 +92,8 @@ async def get_db_repos() -> AsyncGenerator[tuple[RecordRepository, JobRepository
 
 @asynccontextmanager
 async def get_job_service() -> AsyncGenerator[tuple[JobService, JobRepository], None]:
-    async with DatabaseSessionManager.get_session_factory() as session:
+    factory = DatabaseSessionManager.get_session_factory()
+    async with factory() as session:
         job_repo: JobRepository = PostgresJobRepository(session)
         task_repo: TaskRepository = PostgresTaskRepository(session)
         record_repo: RecordRepository = PostgresRecordRepository(session)
