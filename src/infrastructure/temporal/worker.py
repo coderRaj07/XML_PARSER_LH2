@@ -58,32 +58,32 @@ async def run_workers(
     worker_tasks.append(asyncio.create_task(workflow_worker.run()))
     logger.info("Workflow worker created", extra={"task_queue": WORKFLOW_QUEUE})
 
-    for _ in range(FETCH_WORKER_COUNT):
-        w = Worker(
-            client=client,
-            task_queue=FETCH_QUEUE,
-            activities=[fetch_activity.fetch_url],
-        )
-        worker_tasks.append(asyncio.create_task(w.run()))
-    logger.info("Fetch workers created", extra={"count": FETCH_WORKER_COUNT, "task_queue": FETCH_QUEUE})
+    w = Worker(
+        client=client,
+        task_queue=FETCH_QUEUE,
+        activities=[fetch_activity.fetch_url],
+        max_concurrent_activities=FETCH_WORKER_COUNT,
+    )
+    worker_tasks.append(asyncio.create_task(w.run()))
+    logger.info("Fetch worker created", extra={"max_concurrent": FETCH_WORKER_COUNT, "task_queue": FETCH_QUEUE})
 
-    for _ in range(PARSE_WORKER_COUNT):
-        w = Worker(
-            client=client,
-            task_queue=PARSE_QUEUE,
-            activities=[parse_activity.parse_records],
-        )
-        worker_tasks.append(asyncio.create_task(w.run()))
-    logger.info("Parse workers created", extra={"count": PARSE_WORKER_COUNT, "task_queue": PARSE_QUEUE})
+    w = Worker(
+        client=client,
+        task_queue=PARSE_QUEUE,
+        activities=[parse_activity.parse_records],
+        max_concurrent_activities=PARSE_WORKER_COUNT,
+    )
+    worker_tasks.append(asyncio.create_task(w.run()))
+    logger.info("Parse worker created", extra={"max_concurrent": PARSE_WORKER_COUNT, "task_queue": PARSE_QUEUE})
 
-    for _ in range(SUMMARIZE_WORKER_COUNT):
-        w = Worker(
-            client=client,
-            task_queue=SUMMARIZE_QUEUE,
-            activities=[summarize_activity.summarize_records],
-        )
-        worker_tasks.append(asyncio.create_task(w.run()))
-    logger.info("Summarize workers created", extra={"count": SUMMARIZE_WORKER_COUNT, "task_queue": SUMMARIZE_QUEUE})
+    w = Worker(
+        client=client,
+        task_queue=SUMMARIZE_QUEUE,
+        activities=[summarize_activity.summarize_records],
+        max_concurrent_activities=SUMMARIZE_WORKER_COUNT,
+    )
+    worker_tasks.append(asyncio.create_task(w.run()))
+    logger.info("Summarize worker created", extra={"max_concurrent": SUMMARIZE_WORKER_COUNT, "task_queue": SUMMARIZE_QUEUE})
 
     logger.info(
         "All workers started",
