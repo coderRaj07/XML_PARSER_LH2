@@ -95,7 +95,7 @@ class ParseActivity:
                 return {"task_id": task_id, "status": "failed", "error": "Task not found"}
 
             try:
-                records = await asyncio.to_thread(self._parser.parse, raw_xml)
+                records = self._parser.parse(raw_xml)
                 for r in records:
                     r.task_id = task_id
 
@@ -138,7 +138,7 @@ class ParseActivity:
                     await asyncio.sleep(1.0 - since_last)
                 try:
                     html = await self._fetcher.fetch(record.source_link)
-                    extracted = await asyncio.to_thread(trafilatura.extract, html)
+                    extracted = trafilatura.extract(html)
                     if extracted and not _is_garbage(extracted):
                         record.full_content = gzip.compress(extracted.encode("utf-8"))
                         record.content = extracted
@@ -193,7 +193,7 @@ class SummarizeActivity:
                         source_text = record.description or ""
                     if _is_garbage(source_text):
                         source_text = record.title or ""
-                    summary_text = await asyncio.to_thread(self._summary_service.generate_summary, source_text)
+                    summary_text = self._summary_service.generate_summary(source_text)
                     summary = Summary(
                         record_id=record.id,
                         summary_text=summary_text,
