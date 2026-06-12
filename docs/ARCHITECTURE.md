@@ -157,6 +157,36 @@ Shared workers:
 - **Queues decouple scheduling from execution** — a fetch backlog won't block the workflow from scheduling parses
 - **Child workflows add independent tracking and isolation** — each URL's progress is visible in Temporal UI, with its own retry/timeout — without requiring their own workers
 
+### History Management via `continue_as_new`
+
+Each child workflow spawn adds events to the **parent's** history. With 101 URLs, the parent would accumulate 1,000+ events, risking Temporal's 50MB history limit.
+
+The parent workflow uses `continue_as_new` after every batch to reset its history:
+
+```
+Parent Workflow (batch 1 of 10 URLs)
+    │  spawn 10 child workflows
+    │  history: ~150 events, ~2MB
+    │
+    ├── continue_as_new(job_id, remaining_91)
+    │
+    ▼
+Parent Workflow (batch 2 of 10 URLs)  ← fresh history
+    │  spawn 10 child workflows
+    │  history: ~150 events, ~2MB
+    │
+    ├── continue_as_new(job_id, remaining_81)
+    │
+    ▼
+... (repeats until all URLs processed)
+```
+
+**Key details:**
+- `BATCH_SIZE = 10` — each execution only tracks 10 child workflows
+- `continue_as_new()` replaces the current execution entirely — the new execution starts with zero history
+- Results are already persisted in the DB by each activity, so no accumulator needs to be passed between executions
+- The last execution returns the final result (only its batch — the API reads full status from the DB)
+
 ### Article-Level: Per-Domain Concurrency
 
 Inside a single feed's activity, article content fetching is now concurrent:

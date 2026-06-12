@@ -149,6 +149,7 @@ Workers pull from queues:
 - **Workflows schedule activities into queues; workers pull from queues.** Workflows never talk to workers directly.
 - **Parent-child split**: `JobWorkflow` spawns one `UrlWorkflow` child per URL. All workflow instances (parent + children) run on the **same** workflow worker. Children are independently visible in Temporal UI with their own retry/timeout.
 - **Each child does not get its own workers** — all children share the same activity workers that poll the same queues
+- **History management**: Parent uses `continue_as_new` every `BATCH_SIZE=10` URLs to reset its event history, avoiding Temporal's 50MB limit. Results are already in the DB, so no accumulator needs to carry over.
 - **Each queue type runs in its own OS process** — true CPU parallelism; a CPU-bound summarize activity doesn't block fetch or parse
 - **No thread pools** — each process has its own event loop
 - **Scale per queue** — `docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2`
