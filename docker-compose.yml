@@ -64,8 +64,10 @@ services:
 
   # Scale workers for more throughput:
   #   docker compose up -d --scale worker=5
-  # Each worker processes activities concurrently from the same task queue.
-  # Effective parallelism is limited by DB pool_size (30) × worker count.
+  # Each worker pod runs 16 Temporal workers by default:
+  #   1 workflow + 5 fetch + 5 parse + 5 summarize
+  # Override per-queue worker counts via env vars:
+  #   docker compose run -e FETCH_WORKERS=10 -e PARSE_WORKERS=10 -e SUMMARIZE_WORKERS=10 worker
   worker:
     build: .
     command: python -m src.infrastructure.temporal.run_worker
@@ -73,6 +75,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
       TEMPORAL_HOST: temporal:7233
       LOG_LEVEL: INFO
+      FETCH_WORKERS: "${FETCH_WORKERS:-5}"
+      PARSE_WORKERS: "${PARSE_WORKERS:-5}"
+      SUMMARIZE_WORKERS: "${SUMMARIZE_WORKERS:-5}"
     depends_on:
       postgres:
         condition: service_healthy
