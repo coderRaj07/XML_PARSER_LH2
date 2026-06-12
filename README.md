@@ -133,20 +133,19 @@ The system is built around **Temporal + asyncio** for concurrency rather than Ce
 ### Concurrency Model
 
 ```
-Workflow (deterministic)
+JobWorkflow (parent, deterministic)
     │
-    ├── Stage 1: Fetch all URLs ──────────────────────────────► xml-feed-fetch-queue (container per process)
-    │      fetch_url(task_id, url, job_id) → raw_xml
+    ├── Spawn UrlWorkflow per URL ───► child workflow per URL
+    │      (independently tracked in Temporal UI)
     │
-    ├── Stage 2: Parse all fetched XMLs ──────────────────────► xml-feed-parse-queue (container per process)
-    │      parse_records(task_id, raw_xml, job_id) → records stored in DB
-    │
-    └── Stage 3: Summarize all parsed records ────────────────► xml-feed-summarize-queue (container per process)
-           summarize_records(task_id, job_id) → summaries generated, task marked complete
+    Each UrlWorkflow (child):
+    │   ├── fetch_url ──► xml-feed-fetch-queue (own process)
+    │   ├── parse_records ──► xml-feed-parse-queue (own process)
+    │   └── summarize_records ──► xml-feed-summarize-queue (own process)
 ```
 
-- **Feed-level**: URLs process independently through all 3 stages (fetch → parse → summarize) — each URL progresses without waiting for others at the same stage
-- **Each queue runs in its own OS process** — true CPU parallelism across all 4 containers (workflow + fetch + parse + summarize)
+- **Parent-child split**: `JobWorkflow` spawns one `UrlWorkflow` child per URL. Each child is independently visible in Temporal UI with its own retry/timeout.
+- **Each queue runs in its own OS process** — true CPU parallelism across all containers
 - **No thread pools** — each process has its own event loop; blocking CPU calls (`trafilatura.extract`, `generate_summary`) don't stall other queues
 - **Scale per queue** — `docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2`
 - **Article-level**: within a feed's parse stage, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle

@@ -20,6 +20,7 @@ from src.infrastructure.temporal.workflows import (
     SUMMARIZE_QUEUE,
     WORKFLOW_QUEUE,
     JobWorkflow,
+    UrlWorkflow,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ async def run_queue_worker(
         w = Worker(
             client=client,
             task_queue=WORKFLOW_QUEUE,
-            workflows=[JobWorkflow],
+            workflows=[JobWorkflow, UrlWorkflow],
         )
         worker_task = asyncio.create_task(w.run())
         logger.info("Workflow worker started", extra={"task_queue": WORKFLOW_QUEUE})

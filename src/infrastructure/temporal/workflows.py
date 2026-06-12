@@ -9,6 +9,7 @@ with workflow.unsafe.imports_passed_through():
     pass
 
 WORKFLOW_NAME = "job-workflow"
+CHILD_WORKFLOW_NAME = "url-workflow"
 WORKFLOW_QUEUE = "xml-feed-workflow-queue"
 FETCH_QUEUE = "xml-feed-fetch-queue"
 PARSE_QUEUE = "xml-feed-parse-queue"
@@ -21,6 +22,7 @@ RETRY_POLICY = RetryPolicy(
     maximum_interval=timedelta(seconds=30),
     backoff_coefficient=2.0,
 )
+CHILD_WORKFLOW_TIMEOUT = timedelta(minutes=30)
 
 
 @workflow.defn(name=WORKFLOW_NAME)
@@ -33,7 +35,10 @@ class JobWorkflow:
         for batch_start in range(0, len(tasks), BATCH_SIZE):
             batch = tasks[batch_start : batch_start + BATCH_SIZE]
             results = await asyncio.gather(
-                *[self._process_url(task_id, url, job_id) for task_id, url in batch],
+                *[
+                    self._process_url_via_child(task_id, url, job_id)
+                    for task_id, url in batch
+                ],
                 return_exceptions=True,
             )
             for (task_id, _), result in zip(batch, results):
@@ -53,7 +58,24 @@ class JobWorkflow:
             "results": [task_results[tid] for tid in all_task_ids],
         }
 
-    async def _process_url(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
+    async def _process_url_via_child(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
+        try:
+            result = await workflow.execute_child_workflow(
+                CHILD_WORKFLOW_NAME,
+                args=[task_id, url, job_id],
+                id=f"{job_id}/url/{task_id}",
+                task_queue=WORKFLOW_QUEUE,
+                execution_timeout=CHILD_WORKFLOW_TIMEOUT,
+            )
+            return result
+        except Exception as e:
+            return {"task_id": task_id, "status": "failed", "error": str(e)}
+
+
+@workflow.defn(name=CHILD_WORKFLOW_NAME)
+class UrlWorkflow:
+    @workflow.run
+    async def run(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
         try:
             fetch_result = await workflow.execute_activity(
                 "fetch_url",

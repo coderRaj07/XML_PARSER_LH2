@@ -57,24 +57,26 @@
 ### Feed-Level: 3-Stage Pipeline with Dedicated Queues
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  JobWorkflow.run(job_id, tasks)                           │
-│                                                            │
-│  For each batch of BATCH_SIZE URLs:                       │
-│    asyncio.gather(                                         │
-│      _process_url(t1, u1, j1)  ──► fetch ──► parse ──► summarize
-│      _process_url(t2, u2, j2)  ──► fetch ──► parse ──► summarize
-│      ...                                                   │
-│    )                                                       │
-│                                                            │
-│  Each URL runs independently through all 3 stages:        │
-│    fetch_url  ──► xml-feed-fetch-queue (own process)      │
-│    parse_records ──► xml-feed-parse-queue (own process)   │
-│    summarize_records ──► xml-feed-summarize-queue (own)   │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  JobWorkflow.run(job_id, tasks) (parent)                         │
+│                                                                  │
+│  For each batch of BATCH_SIZE URLs:                              │
+│    asyncio.gather(                                                │
+│      execute_child_workflow("url-workflow", t1, u1, j1)         │
+│      execute_child_workflow("url-workflow", t2, u2, j2)         │
+│      ...                                                         │
+│    )                                                             │
+│                                                                  │
+│  Each URL → UrlWorkflow (child, tracked independently in UI)    │
+│                                                                  │
+│    UrlWorkflow (url-workflow):                                   │
+│      ├── fetch_url  ──► xml-feed-fetch-queue (own process)     │
+│      ├── parse_records ──► xml-feed-parse-queue (own process)  │
+│      └── summarize_records ──► xml-feed-summarize-queue (own)  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-Each queue runs in its own Docker container (OS process) for true CPU parallelism. Failed tasks at any stage are caught and returned as failures without blocking other URLs.
+Each queue runs in its own Docker container (OS process) for true CPU parallelism. Each URL has its own child workflow for independent tracking, retry, and timeout. Failed tasks at any stage are caught and returned as failures without blocking other URLs.
 
 ### Article-Level: Per-Domain Concurrency
 
@@ -133,35 +135,29 @@ POST /jobs {"urls": [...]}
 Create Job + Tasks in DB
   │
   ▼
-Start Temporal Workflow (JobWorkflow)
+Start Temporal Workflow — JobWorkflow (parent)
   │
   ▼
-Stage 1 — Fetch Queue (own process)
-  │  asyncio.gather(all tasks in batch)
-  │  ├──► fetch_url(task_id, url, job_id)
-  │  │      └── aiohttp.get(url) → raw_xml
-  │  └──► ... (repeat for each URL)
+Spawn Child Workflows per URL — UrlWorkflow (batched via asyncio.gather)
+  │  Each child runs independently:
   │
-  ▼
-Stage 2 — Parse Queue (own process)
-  │  asyncio.gather(successful fetches in batch)
-  │  ├──► parse_records(task_id, raw_xml, job_id)
-  │  │      ├── feedparser.parse(raw_xml) → records
-  │  │      ├── Truncate to max_articles=10
-  │  │      ├── Fetch full article content ← CONCURRENT per-domain
-  │  │      │      (trafilatura, gzip-compress full_content)
-  │  │      └── Store records in DB → session.commit()
-  │  └──► ... (repeat for each successful fetch)
-  │
-  ▼
-Stage 3 — Summarize Queue (own process)
-  │  asyncio.gather(successful parses in batch)
-  │  ├──► summarize_records(task_id, job_id)
-  │  │      ├── list records by task_id from DB
-  │  │      ├── generate summaries (TextRank + TF-IDF + LSA)
-  │  │      ├── mark task completed
-  │  │      └── update job progress → session.commit()
-  │  └──► ... (repeat for each successful parse)
+  │  UrlWorkflow[task_id]:
+  │    │
+  │    ├──► fetch_url ──► xml-feed-fetch-queue (own process)
+  │    │      └── aiohttp.get(url) → raw_xml
+  │    │
+  │    ├──► parse_records ──► xml-feed-parse-queue (own process)
+  │    │      ├── feedparser.parse(raw_xml) → records
+  │    │      ├── Truncate to max_articles=10
+  │    │      ├── Fetch full article content ← CONCURRENT per-domain
+  │    │      │      (trafilatura, gzip-compress full_content)
+  │    │      └── Store records in DB → session.commit()
+  │    │
+  │    └──► summarize_records ──► xml-feed-summarize-queue (own process)
+  │           ├── list records by task_id from DB
+  │           ├── generate summaries (TextRank + TF-IDF + LSA)
+  │           ├── mark task completed
+  │           └── update job progress → session.commit()
 ```
 
 ## Key Decisions
