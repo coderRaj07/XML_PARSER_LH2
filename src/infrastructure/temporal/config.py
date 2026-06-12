@@ -14,6 +14,7 @@ FETCH_WORKER_COUNT = int(os.getenv("FETCH_WORKERS", "5"))
 PARSE_WORKER_COUNT = int(os.getenv("PARSE_WORKERS", "5"))
 SUMMARIZE_WORKER_COUNT = int(os.getenv("SUMMARIZE_WORKERS", "5"))
 
+BATCH_SIZE = int(os.getenv("WORKFLOW_BATCH_SIZE", "50"))
 ACTIVITY_TIMEOUT = timedelta(minutes=int(os.getenv("ACTIVITY_TIMEOUT_MINUTES", "5")))
 RETRY_POLICY = RetryPolicy(
     maximum_attempts=int(os.getenv("ACTIVITY_MAX_RETRIES", "3")),
