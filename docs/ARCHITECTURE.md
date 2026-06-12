@@ -52,31 +52,110 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Concurrency Model
+## How Workflows and Workers Interact
 
-### Feed-Level: 3-Stage Pipeline with Dedicated Queues
+A common misconception is that workflows push activities directly into workers. In reality:
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  JobWorkflow.run(job_id, tasks) (parent)                         │
-│                                                                  │
-│  For each batch of BATCH_SIZE URLs:                              │
-│    asyncio.gather(                                                │
-│      execute_child_workflow("url-workflow", t1, u1, j1)         │
-│      execute_child_workflow("url-workflow", t2, u2, j2)         │
-│      ...                                                         │
-│    )                                                             │
-│                                                                  │
-│  Each URL → UrlWorkflow (child, tracked independently in UI)    │
-│                                                                  │
-│    UrlWorkflow (url-workflow):                                   │
-│      ├── fetch_url  ──► xml-feed-fetch-queue (own process)     │
-│      ├── parse_records ──► xml-feed-parse-queue (own process)  │
-│      └── summarize_records ──► xml-feed-summarize-queue (own)  │
-└──────────────────────────────────────────────────────────────────┘
+Workflow                          Task Queue              Worker
+    │                                 │                       │
+    ├── Schedule Activity ─────────► fetch-queue ──────────► Fetch Worker
+    │                                 │                       │
+    ├── Schedule Activity ─────────► parse-queue ──────────► Parse Worker
+    │                                 │                       │
+    └── Schedule Activity ─────────► summary-queue ────────► Summary Worker
 ```
 
-Each queue runs in its own Docker container (OS process) for true CPU parallelism. Each URL has its own child workflow for independent tracking, retry, and timeout. Failed tasks at any stage are caught and returned as failures without blocking other URLs.
+**Workflows schedule activities into task queues. Workers pull tasks from those queues and execute them.** A workflow never talks to a worker directly.
+
+### Parent and Child Workflows
+
+With 100 URLs:
+
+**Without child workflows** — one workflow manages everything:
+
+```
+Workflow A
+    ├── Fetch URL1 → Parse URL1 → Summary URL1
+    ├── Fetch URL2 → Parse URL2 → Summary URL2
+    └── ...
+```
+
+**With child workflows** — parent delegates each URL to a child:
+
+```
+Parent Workflow
+    ├── Child Workflow URL1
+    ├── Child Workflow URL2
+    └── Child Workflow URL3
+        ...
+```
+
+Each child then schedules its own activities:
+
+```
+Child Workflow URL1
+    ├── Fetch Activity   ──► fetch-queue
+    ├── Parse Activity   ──► parse-queue
+    └── Summary Activity ──► summary-queue
+```
+
+### Do Child Workflows Get Their Own Workers?
+
+**No.** All workflow instances (parent + all children) share the **same workflow worker**:
+
+```
+Workflow Worker (1 process)
+    ├── Parent Workflow
+    ├── Child Workflow URL1
+    ├── Child Workflow URL2
+    ├── Child Workflow URL3
+    └── ... (thousands more)
+```
+
+One workflow worker can execute thousands of workflow instances concurrently.
+
+Similarly, all child workflows share the **same activity workers**. Activities from URL1, URL2, and URL3 all go to the same `fetch-queue`, and any available `fetch-worker` picks them up:
+
+```
+Child URL1 ──► fetch activity ──► fetch-queue ──► Fetch Worker (any available)
+Child URL2 ──► fetch activity ──► fetch-queue ──► Fetch Worker (any available)
+Child URL3 ──► fetch activity ──► fetch-queue ──► Fetch Worker (any available)
+```
+
+### Real Picture
+
+```
+Parent Workflow (JobWorkflow)
+    │
+    ├── Child Workflow URL1
+    │       ├── fetch-queue ──── Fetch Worker
+    │       ├── parse-queue ──── Parse Worker
+    │       └── summary-queue ── Summary Worker
+    │
+    ├── Child Workflow URL2
+    │       ├── fetch-queue ──── Fetch Worker
+    │       ├── parse-queue ──── Parse Worker
+    │       └── summary-queue ── Summary Worker
+    │
+    └── Child Workflow URL3
+            ├── fetch-queue ──── Fetch Worker
+            ├── parse-queue ──── Parse Worker
+            └── summary-queue ── Summary Worker
+
+Shared workers:
+    workflow-worker ── runs all workflows (parent + children)
+    fetch-worker     ── polls fetch-queue for all fetch activities
+    parse-worker     ── polls parse-queue for all parse activities
+    summary-worker   ── polls summary-queue for all summary activities
+```
+
+### Why This Matters
+
+- **Workflows are deterministic** — they only schedule and react; they never execute
+- **Workers are stateless** — they pull the next task and run it
+- **Queues decouple scheduling from execution** — a fetch backlog won't block the workflow from scheduling parses
+- **Child workflows add independent tracking and isolation** — each URL's progress is visible in Temporal UI, with its own retry/timeout — without requiring their own workers
 
 ### Article-Level: Per-Domain Concurrency
 
@@ -101,19 +180,19 @@ _fetch_full_contents(records=[r1, r2, r3, r4, ...])
 ### Activity-Level: Per-Activity DB Sessions (FastAPI-style)
 
 ```
-FetchActivity (fetch-queue)
+FetchActivity (polled from fetch-queue by fetch-worker)
   └── async with session_factory() as session:
         fetcher.fetch(url) → raw_xml
         (no DB needed unless error — then task marked failed)
 
-ParseActivity (parse-queue)
+ParseActivity (polled from parse-queue by parse-worker)
   └── async with session_factory() as session:
         parser.parse(raw_xml) → records
         fetch_full_contents(records)  ← concurrent per-domain
         record_repo.create_many(records)
         session.commit()
 
-SummarizeActivity (summarize-queue)
+SummarizeActivity (polled from summary-queue by summary-worker)
   └── async with session_factory() as session:
         record_repo.list_by_task(task_id) → records
         for each record: generate_summary → save_summary
@@ -135,37 +214,46 @@ POST /jobs {"urls": [...]}
 Create Job + Tasks in DB
   │
   ▼
-Start Temporal Workflow — JobWorkflow (parent)
+Start Temporal Workflow — JobWorkflow (parent, on workflow-worker)
   │
   ▼
-Spawn Child Workflows per URL — UrlWorkflow (batched via asyncio.gather)
-  │  Each child runs independently:
+Parent spawns Child Workflows per URL (batched via asyncio.gather)
+  │  All children run on the same workflow-worker
+  │
+  ▼
+Each UrlWorkflow schedules activities into task queues:
   │
   │  UrlWorkflow[task_id]:
   │    │
-  │    ├──► fetch_url ──► xml-feed-fetch-queue (own process)
-  │    │      └── aiohttp.get(url) → raw_xml
+  │    ├──► Schedule fetch_url ──► xml-feed-fetch-queue
+  │    │         │
+  │    │         └── Fetch Worker (polls queue) → aiohttp.get(url) → raw_xml
   │    │
-  │    ├──► parse_records ──► xml-feed-parse-queue (own process)
-  │    │      ├── feedparser.parse(raw_xml) → records
-  │    │      ├── Truncate to max_articles=10
-  │    │      ├── Fetch full article content ← CONCURRENT per-domain
-  │    │      │      (trafilatura, gzip-compress full_content)
-  │    │      └── Store records in DB → session.commit()
+  │    ├──► Schedule parse_records ──► xml-feed-parse-queue
+  │    │         │
+  │    │         └── Parse Worker (polls queue)
+  │    │                ├── feedparser.parse(raw_xml) → records
+  │    │                ├── Truncate to max_articles=10
+  │    │                ├── Fetch full article content ← CONCURRENT per-domain
+  │    │                │      (trafilatura, gzip-compress full_content)
+  │    │                └── Store records in DB → session.commit()
   │    │
-  │    └──► summarize_records ──► xml-feed-summarize-queue (own process)
-  │           ├── list records by task_id from DB
-  │           ├── generate summaries (TextRank + TF-IDF + LSA)
-  │           ├── mark task completed
-  │           └── update job progress → session.commit()
+  │    └──► Schedule summarize_records ──► xml-feed-summarize-queue
+  │              │
+  │              └── Summary Worker (polls queue)
+  │                     ├── list records by task_id from DB
+  │                     ├── generate summaries (TextRank + TF-IDF + LSA)
+  │                     ├── mark task completed
+  │                     └── update job progress → session.commit()
+```
 ```
 
 ## Key Decisions
 
 ### Why 3 separate queues?
-- **Independent scaling**: fetch (I/O-bound), parse (I/O + CPU), summarize (CPU-bound) each run as separate OS processes, independently scalable via `docker compose --scale`
+- **Independent scaling**: fetch (I/O-bound), parse (I/O + CPU), summarize (CPU-bound) each have their own workers and queues, independently scalable via `docker compose --scale`
 - **Isolation**: a fetch backlog doesn't starve summarize workers; each stage can be tuned independently
-- **No thread pools**: each process has its own event loop — blocking CPU calls don't stall other queues
+- **No thread pools**: each worker process has its own event loop — blocking CPU calls in summarize don't stall fetch or parse
 
 ### Why Temporal?
 - Durable execution with built-in retry + backoff

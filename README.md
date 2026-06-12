@@ -133,20 +133,24 @@ The system is built around **Temporal + asyncio** for concurrency rather than Ce
 ### Concurrency Model
 
 ```
-JobWorkflow (parent, deterministic)
+Parent Workflow (JobWorkflow)
     │
-    ├── Spawn UrlWorkflow per URL ───► child workflow per URL
-    │      (independently tracked in Temporal UI)
-    │
-    Each UrlWorkflow (child):
-    │   ├── fetch_url ──► xml-feed-fetch-queue (own process)
-    │   ├── parse_records ──► xml-feed-parse-queue (own process)
-    │   └── summarize_records ──► xml-feed-summarize-queue (own process)
+    ├── Child Workflow URL1 ──► schedules activities ──► queues
+    ├── Child Workflow URL2 ──► schedules activities ──► queues
+    └── Child Workflow URL3 ──► schedules activities ──► queues
+
+Workers pull from queues:
+    workflow-worker ──► runs all workflows (parent + all children)
+    fetch-worker     ──► polls fetch-queue
+    parse-worker     ──► polls parse-queue
+    summary-worker   ──► polls summary-queue
 ```
 
-- **Parent-child split**: `JobWorkflow` spawns one `UrlWorkflow` child per URL. Each child is independently visible in Temporal UI with its own retry/timeout.
-- **Each queue runs in its own OS process** — true CPU parallelism across all containers
-- **No thread pools** — each process has its own event loop; blocking CPU calls (`trafilatura.extract`, `generate_summary`) don't stall other queues
+- **Workflows schedule activities into queues; workers pull from queues.** Workflows never talk to workers directly.
+- **Parent-child split**: `JobWorkflow` spawns one `UrlWorkflow` child per URL. All workflow instances (parent + children) run on the **same** workflow worker. Children are independently visible in Temporal UI with their own retry/timeout.
+- **Each child does not get its own workers** — all children share the same activity workers that poll the same queues
+- **Each queue type runs in its own OS process** — true CPU parallelism; a CPU-bound summarize activity doesn't block fetch or parse
+- **No thread pools** — each process has its own event loop
 - **Scale per queue** — `docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2`
 - **Article-level**: within a feed's parse stage, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
 - **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory using `async with` (FastAPI-style) — auto-closes on exit, auto-rollbacks on error
