@@ -14,7 +14,7 @@ WORKFLOW_QUEUE = "xml-feed-workflow-queue"
 FETCH_QUEUE = "xml-feed-fetch-queue"
 PARSE_QUEUE = "xml-feed-parse-queue"
 SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
-BATCH_SIZE = 50
+BATCH_SIZE = 10  # keep per-batch history small; continue_as_new resets between batches
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 RETRY_POLICY = RetryPolicy(
     maximum_attempts=3,
@@ -29,33 +29,28 @@ CHILD_WORKFLOW_TIMEOUT = timedelta(minutes=30)
 class JobWorkflow:
     @workflow.run
     async def run(self, job_id: str, tasks: list[tuple[str, str]]) -> dict[str, Any]:
-        all_task_ids = [tid for tid, _ in tasks]
-        task_results: dict[str, dict[str, Any]] = {}
+        batch = tasks[:BATCH_SIZE]
+        remaining = tasks[BATCH_SIZE:]
 
-        for batch_start in range(0, len(tasks), BATCH_SIZE):
-            batch = tasks[batch_start : batch_start + BATCH_SIZE]
-            results = await asyncio.gather(
-                *[
-                    self._process_url_via_child(task_id, url, job_id)
-                    for task_id, url in batch
-                ],
-                return_exceptions=True,
-            )
-            for (task_id, _), result in zip(batch, results):
-                if isinstance(result, Exception):
-                    task_results[task_id] = {"status": "failed", "error": str(result)}
-                else:
-                    task_results[task_id] = result
+        results = await asyncio.gather(
+            *[
+                self._process_url_via_child(task_id, url, job_id)
+                for task_id, url in batch
+            ],
+            return_exceptions=True,
+        )
 
-        completed = sum(1 for r in task_results.values() if r.get("status") == "completed")
-        failed = sum(1 for r in task_results.values() if r.get("status") == "failed")
+        if remaining:
+            workflow.continue_as_new(job_id, remaining)
+
+        completed = sum(1 for r in results if not isinstance(r, Exception) and r.get("status") == "completed")
+        failed = sum(1 for r in results if isinstance(r, Exception) or r.get("status") == "failed")
 
         return {
             "job_id": job_id,
-            "total": len(tasks),
+            "total": len(batch),
             "completed": completed,
             "failed": failed,
-            "results": [task_results[tid] for tid in all_task_ids],
         }
 
     async def _process_url_via_child(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
