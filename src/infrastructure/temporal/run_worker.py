@@ -8,7 +8,7 @@ from src.application.strategies.parser.base_parser_strategy import ParserStrateg
 from src.application.services.summary_service import SummaryService
 from src.infrastructure.db import DatabaseSessionManager
 from src.infrastructure.fetchers import AioHttpFetcher
-from src.infrastructure.temporal.worker import run_worker
+from src.infrastructure.temporal.worker import run_workers
 from src.application.strategies.parser import RSSParser
 from src.application.strategies.summary import ExtractiveSummaryStrategy
 
@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/xml_feeds")
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "localhost:7233")
-TASK_QUEUE = "xml-feed-queue"
 
 
 async def main() -> None:
@@ -35,10 +34,9 @@ async def main() -> None:
     summary_strategy = ExtractiveSummaryStrategy()
     summary_service = SummaryService(strategy=summary_strategy)
 
-    logger.info("Starting Temporal worker")
-    await run_worker(
+    logger.info("Starting Temporal workers (5 per queue)")
+    await run_workers(
         temporal_host=TEMPORAL_HOST,
-        task_queue=TASK_QUEUE,
         session_factory=session_factory,
         fetcher=fetcher,
         parser=parser,

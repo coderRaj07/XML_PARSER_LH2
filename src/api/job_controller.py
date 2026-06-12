@@ -1,7 +1,4 @@
 from fastapi import APIRouter, HTTPException
-
-from src.application.interfaces.repositories import JobRepository
-from src.application.services.job_service import JobService
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -22,26 +19,19 @@ class JobStatusResponse(BaseModel):
     failed: int
 
 
-async def get_job_service() -> tuple[JobService, JobRepository]:
-    from src.main import get_job_service as factory
-    return await factory()
-
-
 @router.post("", response_model=CreateJobResponse, status_code=201)
 async def create_job(request: CreateJobRequest) -> CreateJobResponse:
-    service, repo = await get_job_service()
-    try:
+    from src.main import get_job_service as factory
+    async with factory() as (service, repo):
         job = await service.create_job(request.urls)
         await repo.commit()
         return CreateJobResponse(job_id=job.id)
-    finally:
-        await repo.close()
 
 
 @router.get("/{job_id}", response_model=JobStatusResponse)
 async def get_job(job_id: str) -> JobStatusResponse:
-    service, repo = await get_job_service()
-    try:
+    from src.main import get_job_service as factory
+    async with factory() as (service, repo):
         job = await service.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -51,14 +41,12 @@ async def get_job(job_id: str) -> JobStatusResponse:
             completed=job.completed_tasks,
             failed=job.failed_tasks,
         )
-    finally:
-        await repo.close()
 
 
 @router.get("/{job_id}/tasks")
 async def list_tasks(job_id: str) -> list[dict]:
-    service, repo = await get_job_service()
-    try:
+    from src.main import get_job_service as factory
+    async with factory() as (service, repo):
         tasks = await service.list_tasks(job_id)
         return [
             {
@@ -70,5 +58,3 @@ async def list_tasks(job_id: str) -> list[dict]:
             }
             for t in tasks
         ]
-    finally:
-        await repo.close()

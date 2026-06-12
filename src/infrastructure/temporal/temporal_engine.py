@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class TemporalEngine(ExecutionEngine):
-    def __init__(self, temporal_host: str = "localhost:7233", task_queue: str = "xml-feed-queue") -> None:
+    def __init__(self, temporal_host: str = "localhost:7233", task_queue: str = "xml-feed-workflow-queue") -> None:
         self._temporal_host = temporal_host
         self._task_queue = task_queue
         self._client: Client | None = None

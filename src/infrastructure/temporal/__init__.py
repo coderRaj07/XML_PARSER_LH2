@@ -1,5 +1,5 @@
 from .temporal_engine import TemporalEngine
 from .workflows import JobWorkflow
-from .activities import URLProcessingActivity
+from .activities import FetchActivity, ParseActivity, SummarizeActivity
 
-__all__ = ["TemporalEngine", "JobWorkflow", "URLProcessingActivity"]
+__all__ = ["TemporalEngine", "JobWorkflow", "FetchActivity", "ParseActivity", "SummarizeActivity"]

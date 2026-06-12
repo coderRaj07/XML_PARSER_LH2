@@ -4,14 +4,7 @@ import re
 
 from fastapi import APIRouter, HTTPException
 
-from src.application.interfaces.repositories import JobRepository, RecordRepository
-
 router = APIRouter(tags=["records"])
-
-
-async def get_repos() -> tuple[RecordRepository, JobRepository]:
-    from src.main import get_db_repos
-    return await get_db_repos()
 
 
 def _clean_html(text: str | None, max_len: int | None = None) -> str | None:
@@ -28,8 +21,8 @@ def _clean_html(text: str | None, max_len: int | None = None) -> str | None:
 
 @router.get("/jobs/{job_id}/records")
 async def list_records(job_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
-    record_repo, job_repo = await get_repos()
-    try:
+    from src.main import get_db_repos
+    async with get_db_repos() as (record_repo, job_repo):
         job = await job_repo.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -49,15 +42,12 @@ async def list_records(job_id: str, limit: int = 50, offset: int = 0) -> list[di
                 "summary": _clean_html(summary.summary_text) if summary else None,
             })
         return result
-    finally:
-        await record_repo.close()
-        await job_repo.close()
 
 
 @router.get("/records/{record_id}")
 async def get_record(record_id: str) -> dict:
-    record_repo, job_repo = await get_repos()
-    try:
+    from src.main import get_db_repos
+    async with get_db_repos() as (record_repo, job_repo):
         record = await record_repo.get(record_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Record not found")
@@ -80,6 +70,3 @@ async def get_record(record_id: str) -> dict:
             "full_content": full_content,
             "summary": _clean_html(summary.summary_text) if summary else None,
         }
-    finally:
-        await record_repo.close()
-        await job_repo.close()

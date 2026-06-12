@@ -81,29 +81,29 @@ def build_container() -> None:
     register_service(SummaryService, summary_service)
 
 
-async def get_db_repos() -> tuple[RecordRepository, JobRepository]:
-    session_factory = DatabaseSessionManager.get_session_factory()
-    session = session_factory()
-    record_repo: RecordRepository = PostgresRecordRepository(session)
-    job_repo: JobRepository = PostgresJobRepository(session)
-    return record_repo, job_repo
+@asynccontextmanager
+async def get_db_repos() -> AsyncGenerator[tuple[RecordRepository, JobRepository], None]:
+    async with DatabaseSessionManager.get_session_factory() as session:
+        record_repo: RecordRepository = PostgresRecordRepository(session)
+        job_repo: JobRepository = PostgresJobRepository(session)
+        yield record_repo, job_repo
 
 
-async def get_job_service() -> tuple[JobService, JobRepository]:
-    session_factory = DatabaseSessionManager.get_session_factory()
-    session = session_factory()
-    job_repo: JobRepository = PostgresJobRepository(session)
-    task_repo: TaskRepository = PostgresTaskRepository(session)
-    record_repo: RecordRepository = PostgresRecordRepository(session)
-    scheduler = get_service(Scheduler)
-    execution_engine = get_service(TemporalEngine)
-    service = JobService(
-        job_repository=job_repo,
-        task_repository=task_repo,
-        scheduler=scheduler,
-        execution_engine=execution_engine,
-    )
-    return service, job_repo
+@asynccontextmanager
+async def get_job_service() -> AsyncGenerator[tuple[JobService, JobRepository], None]:
+    async with DatabaseSessionManager.get_session_factory() as session:
+        job_repo: JobRepository = PostgresJobRepository(session)
+        task_repo: TaskRepository = PostgresTaskRepository(session)
+        record_repo: RecordRepository = PostgresRecordRepository(session)
+        scheduler = get_service(Scheduler)
+        execution_engine = get_service(TemporalEngine)
+        service = JobService(
+            job_repository=job_repo,
+            task_repository=task_repo,
+            scheduler=scheduler,
+            execution_engine=execution_engine,
+        )
+        yield service, job_repo
 
 
 @asynccontextmanager

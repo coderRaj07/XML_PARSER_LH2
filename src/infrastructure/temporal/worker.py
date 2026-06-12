@@ -8,15 +8,23 @@ from temporalio.worker import Worker
 from src.application.interfaces.fetcher import Fetcher
 from src.application.services.summary_service import SummaryService
 from src.application.strategies.parser.base_parser_strategy import ParserStrategy
-from src.infrastructure.temporal.activities import URLProcessingActivity
+from src.infrastructure.temporal.activities import FetchActivity, ParseActivity, SummarizeActivity
 from src.infrastructure.temporal.workflows import JobWorkflow
 
 logger = logging.getLogger(__name__)
 
+WORKFLOW_QUEUE = "xml-feed-workflow-queue"
+FETCH_QUEUE = "xml-feed-fetch-queue"
+PARSE_QUEUE = "xml-feed-parse-queue"
+SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
 
-async def run_worker(
+FETCH_WORKER_COUNT = 5
+PARSE_WORKER_COUNT = 5
+SUMMARIZE_WORKER_COUNT = 5
+
+
+async def run_workers(
     temporal_host: str,
-    task_queue: str,
     session_factory: async_sessionmaker[AsyncSession],
     fetcher: Fetcher,
     parser: ParserStrategy,
@@ -24,19 +32,59 @@ async def run_worker(
 ) -> None:
     client = await Client.connect(temporal_host)
 
-    activity = URLProcessingActivity(
+    fetch_activity = FetchActivity(
         session_factory=session_factory,
         fetcher=fetcher,
+    )
+    parse_activity = ParseActivity(
+        session_factory=session_factory,
         parser=parser,
+        fetcher=fetcher,
+    )
+    summarize_activity = SummarizeActivity(
+        session_factory=session_factory,
         summary_service=summary_service,
     )
 
-    worker = Worker(
-        client=client,
-        task_queue=task_queue,
-        workflows=[JobWorkflow],
-        activities=[activity.process_url],
-    )
+    worker_tasks: list[asyncio.Task[None]] = []
 
-    logger.info("Temporal worker started", extra={"task_queue": task_queue})
-    await worker.run()
+    workflow_worker = Worker(
+        client=client,
+        task_queue=WORKFLOW_QUEUE,
+        workflows=[JobWorkflow],
+    )
+    worker_tasks.append(asyncio.create_task(workflow_worker.run()))
+    logger.info("Workflow worker created", extra={"task_queue": WORKFLOW_QUEUE})
+
+    for _ in range(FETCH_WORKER_COUNT):
+        w = Worker(
+            client=client,
+            task_queue=FETCH_QUEUE,
+            activities=[fetch_activity.fetch_url],
+        )
+        worker_tasks.append(asyncio.create_task(w.run()))
+    logger.info("Fetch workers created", extra={"count": FETCH_WORKER_COUNT, "task_queue": FETCH_QUEUE})
+
+    for _ in range(PARSE_WORKER_COUNT):
+        w = Worker(
+            client=client,
+            task_queue=PARSE_QUEUE,
+            activities=[parse_activity.parse_records],
+        )
+        worker_tasks.append(asyncio.create_task(w.run()))
+    logger.info("Parse workers created", extra={"count": PARSE_WORKER_COUNT, "task_queue": PARSE_QUEUE})
+
+    for _ in range(SUMMARIZE_WORKER_COUNT):
+        w = Worker(
+            client=client,
+            task_queue=SUMMARIZE_QUEUE,
+            activities=[summarize_activity.summarize_records],
+        )
+        worker_tasks.append(asyncio.create_task(w.run()))
+    logger.info("Summarize workers created", extra={"count": SUMMARIZE_WORKER_COUNT, "task_queue": SUMMARIZE_QUEUE})
+
+    logger.info(
+        "All workers started",
+        extra={"total_workers": 1 + FETCH_WORKER_COUNT + PARSE_WORKER_COUNT + SUMMARIZE_WORKER_COUNT},
+    )
+    await asyncio.gather(*worker_tasks)
