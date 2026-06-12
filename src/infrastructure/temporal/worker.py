@@ -9,18 +9,18 @@ from src.application.interfaces.fetcher import Fetcher
 from src.application.services.summary_service import SummaryService
 from src.application.strategies.parser.base_parser_strategy import ParserStrategy
 from src.infrastructure.temporal.activities import FetchActivity, ParseActivity, SummarizeActivity
+from src.infrastructure.temporal.config import (
+    FETCH_QUEUE,
+    FETCH_WORKER_COUNT,
+    PARSE_QUEUE,
+    PARSE_WORKER_COUNT,
+    SUMMARIZE_QUEUE,
+    SUMMARIZE_WORKER_COUNT,
+    WORKFLOW_QUEUE,
+)
 from src.infrastructure.temporal.workflows import JobWorkflow
 
 logger = logging.getLogger(__name__)
-
-WORKFLOW_QUEUE = "xml-feed-workflow-queue"
-FETCH_QUEUE = "xml-feed-fetch-queue"
-PARSE_QUEUE = "xml-feed-parse-queue"
-SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
-
-FETCH_WORKER_COUNT = 5
-PARSE_WORKER_COUNT = 5
-SUMMARIZE_WORKER_COUNT = 5
 
 
 async def run_workers(
