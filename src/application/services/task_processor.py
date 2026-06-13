@@ -1,8 +1,8 @@
 import asyncio
 import gzip
 import logging
-import time
 from asyncio import CancelledError
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import trafilatura
@@ -54,6 +54,7 @@ class TaskProcessor:
         self._record_repository = record_repository
         self._job_repository = job_repository
         self._max_articles = max_articles
+        self._executor = ThreadPoolExecutor(max_workers=4)
 
     async def process_task(self, task: Task) -> Task:
         task.increment_attempts()
@@ -110,8 +111,7 @@ class TaskProcessor:
 
     async def _fetch_full_contents(self, records: list[Record]) -> None:
         semaphores: dict[str, asyncio.Semaphore] = {}
-        last_request: dict[str, float] = {}
-        CONCURRENT_PER_DOMAIN = 2
+        CONCURRENT_PER_DOMAIN = 10
 
         async def _fetch_one(record: Record) -> None:
             if not record.source_link:
@@ -120,10 +120,6 @@ class TaskProcessor:
             if domain not in semaphores:
                 semaphores[domain] = asyncio.Semaphore(CONCURRENT_PER_DOMAIN)
             async with semaphores[domain]:
-                now = time.monotonic()
-                since_last = now - last_request.get(domain, 0.0)
-                if since_last < 1.0:
-                    await asyncio.sleep(1.0 - since_last)
                 try:
                     html = await self._fetcher.fetch(record.source_link)
                     extracted = trafilatura.extract(html)
@@ -140,8 +136,6 @@ class TaskProcessor:
                         "full_content_fetch_failed",
                         extra={"record_id": record.id, "url": record.source_link},
                     )
-                finally:
-                    last_request[domain] = time.monotonic()
 
         coros = [_fetch_one(r) for r in records if r.source_link]
         if not coros:
@@ -158,14 +152,18 @@ class TaskProcessor:
         logger.info("records_stored", extra={"task_id": task.id, "count": len(records)})
 
     async def _summarize(self, records: list[Record]) -> None:
-        for record in records:
+        loop = asyncio.get_running_loop()
+
+        async def _summarize_one(record: Record) -> None:
             logger.info("summary_started", extra={"record_id": record.id})
             source_text = record.content or ""
             if _is_garbage(source_text):
                 source_text = record.description or ""
             if _is_garbage(source_text):
                 source_text = record.title or ""
-            summary_text = self._summary_service.generate_summary(source_text)
+            summary_text = await loop.run_in_executor(
+                self._executor, self._summary_service.generate_summary, source_text
+            )
             summary = Summary(
                 record_id=record.id,
                 summary_text=summary_text,
@@ -174,6 +172,8 @@ class TaskProcessor:
             )
             await self._record_repository.save_summary(summary)
             logger.info("summary_completed", extra={"record_id": record.id})
+
+        await asyncio.gather(*[_summarize_one(r) for r in records])
 
     async def _update_job_progress(self, task: Task) -> None:
         job = await self._job_repository.get(task.job_id)

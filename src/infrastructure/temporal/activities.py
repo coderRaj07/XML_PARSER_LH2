@@ -1,8 +1,8 @@
 import asyncio
 import gzip
 import logging
-import time
 from asyncio import CancelledError
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import trafilatura
@@ -128,8 +128,7 @@ class ParseActivity:
 
     async def _fetch_full_contents(self, records: list[Record]) -> None:
         semaphores: dict[str, asyncio.Semaphore] = {}
-        last_request: dict[str, float] = {}
-        CONCURRENT_PER_DOMAIN = 2
+        CONCURRENT_PER_DOMAIN = 10
 
         async def _fetch_one(record: Record) -> None:
             if not record.source_link:
@@ -138,10 +137,6 @@ class ParseActivity:
             if domain not in semaphores:
                 semaphores[domain] = asyncio.Semaphore(CONCURRENT_PER_DOMAIN)
             async with semaphores[domain]:
-                now = time.monotonic()
-                since_last = now - last_request.get(domain, 0.0)
-                if since_last < 1.0:
-                    await asyncio.sleep(1.0 - since_last)
                 try:
                     html = await self._fetcher.fetch(record.source_link)
                     extracted = trafilatura.extract(html)
@@ -158,8 +153,6 @@ class ParseActivity:
                         "full_content_fetch_failed",
                         extra={"record_id": record.id, "url": record.source_link},
                     )
-                finally:
-                    last_request[domain] = time.monotonic()
 
         coros = [_fetch_one(r) for r in records if r.source_link]
         if not coros:
@@ -175,9 +168,12 @@ class SummarizeActivity:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         summary_service: SummaryService,
+        max_summary_workers: int = 4,
     ) -> None:
         self._session_factory = session_factory
         self._summary_service = summary_service
+        self._max_summary_workers = max_summary_workers
+        self._executor = ThreadPoolExecutor(max_workers=max_summary_workers)
 
     @activity.defn
     async def summarize_records(self, task_id: str, job_id: str) -> dict:
@@ -192,22 +188,29 @@ class SummarizeActivity:
 
             try:
                 records = await record_repo.list_by_task(task_id)
-                for record in records:
+                loop = asyncio.get_running_loop()
+
+                async def _summarize_one(record: Record) -> Summary:
                     logger.info("summary_started", extra={"record_id": record.id})
                     source_text = record.content or ""
                     if _is_garbage(source_text):
                         source_text = record.description or ""
                     if _is_garbage(source_text):
                         source_text = record.title or ""
-                    summary_text = self._summary_service.generate_summary(source_text)
-                    summary = Summary(
+                    summary_text = await loop.run_in_executor(
+                        self._executor, self._summary_service.generate_summary, source_text
+                    )
+                    return Summary(
                         record_id=record.id,
                         summary_text=summary_text,
                         summary_type="extractive",
                         model_used="textrank+tfidf+lsa",
                     )
+
+                summaries = await asyncio.gather(*[_summarize_one(r) for r in records])
+                for summary in summaries:
                     await record_repo.save_summary(summary)
-                    logger.info("summary_completed", extra={"record_id": record.id})
+                    logger.info("summary_completed", extra={"record_id": summary.record_id})
 
                 task.mark_completed()
                 await task_repo.update(task)
