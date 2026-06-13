@@ -110,6 +110,38 @@
 
 ---
 
+## 12. Large Payload Exceeds Temporal gRPC Message Limit
+
+**Issue:** FetchActivity returns raw XML as part of its result (`{"task_id": task_id, "raw_xml": raw_xml}`), which is then passed as an argument to ParseActivity via `fetch_result["raw_xml"]`. For feeds with large RSS/XML payloads, this can exceed Temporal's default 4 MB gRPC message size limit, causing:
+
+```text
+PayloadSizeWarning
+Size: 9496702 bytes
+Limit: 524288 bytes
+
+grpc: received message larger than max (9496960 vs. 4194304)
+```
+
+The activity completion itself fails — this happens before history is written, so Continue-As-New/child workflows cannot fix it.
+
+**Root cause:** Architecture uses Temporal as a data pipe by passing raw content between activities.
+
+**Fix:** Store `raw_xml` in PostgreSQL (e.g., a new `raw_xml` column on the tasks table) inside FetchActivity, and return only small metadata. ParseActivity reads the raw XML from the database instead of receiving it as a workflow argument.
+
+**Before (anti-pattern):**
+```
+FetchActivity → returns raw_xml → workflow → passes raw_xml as arg → ParseActivity
+```
+
+**After (correct):**
+```
+FetchActivity → stores raw_xml in DB → returns task_id → workflow → passes task_id → ParseActivity reads raw_xml from DB
+```
+
+**Files:** `src/infrastructure/temporal/activities.py:57-71` (FetchActivity returns raw_xml), `src/infrastructure/temporal/workflows.py:87-94` (raw_xml passed as arg to ParseActivity)
+
+---
+
 ## 11. Temporal Activity Never Dispatched
 
 **Issue:** After worker restart, some activities in the `asyncio.gather` were never dispatched. The task stayed "pending" with 0 attempts indefinitely.

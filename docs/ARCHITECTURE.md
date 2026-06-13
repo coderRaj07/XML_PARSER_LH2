@@ -235,7 +235,9 @@ Each activity gets a fresh AsyncSession from the pool, managed via
 auto-rollbacks on exception (FastAPI-style lifecycle).
 ```
 
-## Data Flow
+## Data Flow (Current — Has Anti-Pattern)
+
+⚠️ **Note:** The current flow passes `raw_xml` through Temporal between activities. This works for small feeds but breaks for feeds with large RSS/XML payloads (>4 MB) due to Temporal's gRPC message size limit. See [Payload Size Anti-Pattern](#payload-size-anti-pattern-raw-xml-through-temporal) for details and the fix.
 
 ```
 POST /jobs {"urls": [...]}
@@ -258,8 +260,13 @@ Each UrlWorkflow schedules activities into task queues:
   │    ├──► Schedule fetch_url ──► xml-feed-fetch-queue
   │    │         │
   │    │         └── Fetch Worker (polls queue) → aiohttp.get(url) → raw_xml
+  │    │                │
+  │    │                ▼
+  │    │         ⚠️ Returns raw_xml in result → stored in Temporal history
   │    │
   │    ├──► Schedule parse_records ──► xml-feed-parse-queue
+  │    │         │
+  │    │         │  ⚠️ Receives raw_xml as argument → stored in Temporal history again
   │    │         │
   │    │         └── Parse Worker (polls queue)
   │    │                ├── feedparser.parse(raw_xml) → records
@@ -271,12 +278,172 @@ Each UrlWorkflow schedules activities into task queues:
   │    └──► Schedule summarize_records ──► xml-feed-summarize-queue
   │              │
   │              └── Summary Worker (polls queue)
+  │                     ├── list records by task_id from DB ← ✅ correct pattern
+  │                     ├── generate summaries (TextRank + TF-IDF + LSA)
+  │                     ├── mark task completed
+  │                     └── update job progress → session.commit()
+ ```
+ ```
+
+## Data Flow (Fixed — Store Raw XML in MinIO/S3)
+
+```
+POST /jobs {"urls": [...]}
+  │
+  ▼
+Create Job + Tasks in DB
+  │
+  ▼
+Start Temporal Workflow — JobWorkflow (parent, on workflow-worker)
+  │
+  ▼
+Parent spawns Child Workflows per URL (batched via asyncio.gather)
+  │
+  ▼
+Each UrlWorkflow schedules activities into task queues:
+  │
+  │  UrlWorkflow[task_id]:
+  │    │
+  │    ├──► Schedule fetch_url ──► xml-feed-fetch-queue
+  │    │         │
+  │    │         └── Fetch Worker (polls queue)
+  │    │                ├── aiohttp.get(url) → raw_xml
+  │    │                ├── ✅ Store raw_xml in MinIO/S3 (key: feeds/{job_id}/{task_id}.xml)
+  │    │                └── ✅ Return only {"task_id": task_id, "storage_key": storage_key}
+  │    │
+  │    ├──► Schedule parse_records ──► xml-feed-parse-queue
+  │    │         │
+  │    │         └── Parse Worker (polls queue)
+  │    │                ├── ✅ Read raw_xml from MinIO/S3 using storage_key
+  │    │                ├── feedparser.parse(raw_xml) → records
+  │    │                ├── Truncate to max_articles=10
+  │    │                ├── Fetch full article content ← CONCURRENT per-domain
+  │    │                └── Store records in DB → session.commit()
+  │    │
+  │    └──► Schedule summarize_records ──► xml-feed-summarize-queue
+  │              │
+  │              └── Summary Worker (polls queue)
   │                     ├── list records by task_id from DB
   │                     ├── generate summaries (TextRank + TF-IDF + LSA)
   │                     ├── mark task completed
   │                     └── update job progress → session.commit()
 ```
+
+## Payload Size Anti-Pattern: Raw XML Through Temporal
+
+### The Problem
+
+The UrlWorkflow currently passes `raw_xml` (the full RSS/XML feed content) **through Temporal** as a data pipe between activities:
+
 ```
+FetchActivity
+  └── returns {"task_id": "xxx", "raw_xml": "<rss>...</rss>"}  ← stored in history
+        │
+UrlWorkflow receives fetch_result
+  └── passes raw_xml as argument to ParseActivity:
+        args=[task_id, fetch_result["raw_xml"], job_id]        ← stored in history again
+        │
+ParseActivity
+  └── receives raw_xml as argument
+```
+
+This means the entire XML content is serialized twice in Temporal's event history:
+1. As the **activity result** of FetchActivity
+2. As the **activity argument** of ParseActivity
+
+### Failure Mode
+
+Temporal's gRPC layer has a **4 MB message size limit** (default). When an RSS/XML feed response exceeds this threshold:
+
+```
+PayloadSizeWarning
+Size: 9496702 bytes
+Limit: 524288 bytes
+
+grpc: received message larger than max (9496960 vs. 4194304)
+```
+
+The activity completion itself fails because the result cannot fit through gRPC. This error occurs **before any history is written**, so Continue-As-New, child workflows, and more workers cannot fix it.
+
+### Why This Is the Anti-Pattern
+
+| Anti-pattern | Correct pattern |
+|---|---|
+| Pass content through Temporal | Store content in persistent storage |
+| Return HTML/XML as activity result | Return only a reference key |
+| Pass large payloads as activity arguments | Read from DB/storage inside the activity |
+
+The architecture **must not** use Temporal as a data pipe. Temporal is a **workflow orchestrator** — it should only pass small metadata between steps.
+
+### Correct Data Flow
+
+```
+FetchActivity
+  └── fetch URL → raw_xml
+  └── store raw_xml in MinIO/S3 (key: feeds/{job_id}/{task_id}.xml)
+  └── return {"task_id": task_id, "storage_key": storage_key}  ← no raw_xml
+        │
+UrlWorkflow receives small result
+  └── pass storage_key + task_id to ParseActivity:
+        args=[task_id, storage_key, job_id]  ← small, fixed-size arguments
+        │
+ParseActivity
+  └── read raw_xml from MinIO/S3 using storage_key
+  └── parse → records
+  └── fetch full content → store records
+  └── return {"task_id": task_id, "record_count": N}
+```
+
+### Storage Recommendation: MinIO/S3 over PostgreSQL
+
+| Storage | Pros | Cons |
+|---------|------|------|
+| **PostgreSQL** (BYTEA column) | No extra infra; already have DB | Bloats DB; slower for large blobs; backup size grows; vacuum overhead |
+| **MinIO / S3** | Scales to any size; cheap object storage; fast reads; no DB bloat | Extra infra (or AWS cost); need SDK integration |
+
+**Why MinIO/S3 wins for raw XML:**
+
+- RSS feed payloads can grow unboundedly (473+ articles in one feed was already observed in issue #8)
+- A single feed with full article content embedded could be 50+ MB
+- PostgreSQL BYTEA columns with multi-MB rows cause table bloat, slow vacuum, and increased backup sizes
+- MinIO/S3 handles large blobs natively — no DB impact, no size limit, cheaper storage
+- Both activities (fetch and parse) already have the infrastructure to make HTTP calls — adding S3/MinIO is a natural extension
+
+**Use MinIO/S3 when:**
+- Raw XML payloads regularly exceed 1 MB
+- Feed sizes are unpredictable or growing
+- You want to keep the DB lean (only structured data: tasks, records, summaries)
+
+**Use PostgreSQL BYTEA when:**
+- Payloads are consistently small (< 100 KB)
+- You don't want to operate additional infrastructure
+- Simplicity matters more than scalability
+
+For this project, which processes RSS feeds with highly variable sizes (some feeds contain 473+ articles), **MinIO/S3 is the recommended approach**.
+
+### What Stays in Temporal vs. What Goes to Storage
+
+| Data | Goes through Temporal? | Stored in |
+|---|---|---|
+| `task_id` (UUID string) | ✅ Yes | DB |
+| `url` (URL string) | ✅ Yes | DB |
+| `job_id` (UUID string) | ✅ Yes | DB |
+| `record_count` (int) | ✅ Yes | — |
+| `raw_xml` (RSS/XML body) | ❌ **No — fix this** | PostgreSQL |
+| Article HTML | ❌ No (already in DB via `_fetch_full_contents`) | PostgreSQL |
+| `content` / `full_content` | ❌ No (already in DB) | PostgreSQL |
+| Summaries | ❌ No (already in DB) | PostgreSQL |
+
+### Detection
+
+If you see either of these in logs, you have a large-payload problem:
+
+```
+PayloadSizeWarning
+grpc: received message larger than max
+```
+
+Check which activity result or argument is oversized by looking at the size values in the error message. A size of ~9.5 MB indicates raw feed content is being passed through Temporal.
 
 ## Key Decisions
 

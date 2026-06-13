@@ -153,6 +153,55 @@ Worker 101 ┘
 
 ---
 
+## What causes "grpc: received message larger than max" and "PayloadSizeWarning"?
+
+**Short answer:** Activity results or arguments exceed Temporal's **4 MB gRPC message size limit**. This is not a history-size or Continue-As-New problem.
+
+### What it looks like in logs:
+
+```text
+PayloadSizeWarning
+Size: 9496702 bytes
+Limit: 524288 bytes
+
+grpc: received message larger than max (9496960 vs. 4194304)
+```
+
+### What's happening:
+
+1. FetchActivity returns raw RSS/XML content as `{"task_id": "xxx", "raw_xml": "<rss>...</rss>"}`
+2. The UrlWorkflow receives this result and passes `raw_xml` as an argument to ParseActivity
+3. Both the activity result and the activity argument are serialized into Temporal's event history
+4. If the raw XML is ~9.5 MB, it exceeds the 4 MB gRPC limit
+5. The activity completion fails **before history is written**
+
+### What does NOT fix this:
+
+| ❌ Won't fix | Why |
+|---|---|
+| Continue-As-New | Error occurs before history is written |
+| Child workflows | Same gRPC limit applies |
+| More workers | Not a throughput problem |
+| Increasing BATCH_SIZE | Not related to batching |
+
+### The real fix:
+
+Stop passing large payloads through Temporal. Store content in the database and pass only references:
+
+**Anti-pattern (current):**
+```
+FetchActivity → returns raw_xml → workflow → passes raw_xml to ParseActivity
+```
+
+**Correct:**
+```
+FetchActivity → stores raw_xml in DB → returns task_id → workflow → passes task_id to ParseActivity → reads raw_xml from DB
+```
+
+See `docs/ARCHITECTURE.md#payload-size-anti-pattern-raw-xml-through-temporal` for full details.
+
+---
+
 ## What about CPU-bound summarization?
 
 `TextRank + TF-IDF + LSA` summarization runs synchronously inside the summarize worker's event loop. Since each queue is its own **OS process**, a blocking CPU call in summarize doesn't affect fetch or parse workers. The main mitigation is **reducing `max_articles`** and **scaling summarize workers** independently with `--scale summarize-worker=N`.
