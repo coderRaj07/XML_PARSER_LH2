@@ -14,13 +14,12 @@ from src.application.services.summary_service import SummaryService
 from src.application.strategies.parser.base_parser_strategy import ParserStrategy
 from src.domain.entities.record import Record
 from src.domain.entities.summary import Summary
-from src.domain.entities.task import Task
-from src.domain.enums.task_status import TaskStatus
 from src.infrastructure.repositories import (
     PostgresJobRepository,
     PostgresRecordRepository,
     PostgresTaskRepository,
 )
+from src.infrastructure.storage import S3Storage
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +48,20 @@ class FetchActivity:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         fetcher: Fetcher,
+        storage: S3Storage,
     ) -> None:
         self._session_factory = session_factory
         self._fetcher = fetcher
+        self._storage = storage
 
     @activity.defn
     async def fetch_url(self, task_id: str, url: str, job_id: str) -> dict:
         logger.info("fetch_started", extra={"task_id": task_id, "url": url})
         try:
             raw_xml = await self._fetcher.fetch(url)
-            return {"task_id": task_id, "raw_xml": raw_xml}
+            storage_key = self._storage.build_key(job_id, task_id)
+            await self._storage.store(storage_key, raw_xml)
+            return {"task_id": task_id, "storage_key": storage_key}
         except Exception as e:
             logger.error("fetch_failed", extra={"task_id": task_id, "url": url, "error": str(e)})
             async with self._session_factory() as session:
@@ -77,15 +80,17 @@ class ParseActivity:
         session_factory: async_sessionmaker[AsyncSession],
         parser: ParserStrategy,
         fetcher: Fetcher,
+        storage: S3Storage,
         max_articles: int = 10,
     ) -> None:
         self._session_factory = session_factory
         self._parser = parser
         self._fetcher = fetcher
+        self._storage = storage
         self._max_articles = max_articles
 
     @activity.defn
-    async def parse_records(self, task_id: str, raw_xml: str, job_id: str) -> dict:
+    async def parse_records(self, task_id: str, storage_key: str, job_id: str) -> dict:
         async with self._session_factory() as session:
             task_repo = PostgresTaskRepository(session)
             record_repo = PostgresRecordRepository(session)
@@ -95,6 +100,7 @@ class ParseActivity:
                 return {"task_id": task_id, "status": "failed", "error": "Task not found"}
 
             try:
+                raw_xml = await self._storage.retrieve(storage_key)
                 records = self._parser.parse(raw_xml)
                 for r in records:
                     r.task_id = task_id

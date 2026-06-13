@@ -14,7 +14,6 @@ from src.application.strategies.parser.base_parser_strategy import ParserStrateg
 from src.domain.entities.record import Record
 from src.domain.entities.summary import Summary
 from src.domain.entities.task import Task
-from src.domain.enums.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
 

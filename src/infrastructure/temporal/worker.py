@@ -8,6 +8,7 @@ from temporalio.worker import Worker
 from src.application.interfaces.fetcher import Fetcher
 from src.application.services.summary_service import SummaryService
 from src.application.strategies.parser.base_parser_strategy import ParserStrategy
+from src.infrastructure.storage import S3Storage
 from src.infrastructure.temporal.activities import FetchActivity, ParseActivity, SummarizeActivity
 from src.infrastructure.temporal.config import (
     FETCH_WORKER_COUNT,
@@ -32,6 +33,7 @@ async def run_queue_worker(
     fetcher: Fetcher,
     parser: ParserStrategy,
     summary_service: SummaryService,
+    storage: S3Storage,
     queue: str,
 ) -> None:
     client = await Client.connect(temporal_host)
@@ -47,7 +49,7 @@ async def run_queue_worker(
         await worker_task
 
     elif queue == "fetch":
-        activity = FetchActivity(session_factory=session_factory, fetcher=fetcher)
+        activity = FetchActivity(session_factory=session_factory, fetcher=fetcher, storage=storage)
         w = Worker(
             client=client,
             task_queue=FETCH_QUEUE,
@@ -59,7 +61,7 @@ async def run_queue_worker(
         await worker_task
 
     elif queue == "parse":
-        activity = ParseActivity(session_factory=session_factory, parser=parser, fetcher=fetcher)
+        activity = ParseActivity(session_factory=session_factory, parser=parser, fetcher=fetcher, storage=storage)
         w = Worker(
             client=client,
             task_queue=PARSE_QUEUE,

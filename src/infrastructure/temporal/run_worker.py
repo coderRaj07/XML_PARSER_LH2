@@ -8,6 +8,7 @@ from src.application.strategies.parser.base_parser_strategy import ParserStrateg
 from src.application.services.summary_service import SummaryService
 from src.infrastructure.db import DatabaseSessionManager
 from src.infrastructure.fetchers import AioHttpFetcher
+from src.infrastructure.storage import S3Storage
 from src.infrastructure.temporal.worker import run_queue_worker
 from src.application.strategies.parser import RSSParser
 from src.application.strategies.summary import ExtractiveSummaryStrategy
@@ -34,6 +35,7 @@ async def main() -> None:
     parser: ParserStrategy = RSSParser()
     summary_strategy = ExtractiveSummaryStrategy()
     summary_service = SummaryService(strategy=summary_strategy)
+    storage = S3Storage()
 
     logger.info(f"Starting {QUEUE} worker")
     await run_queue_worker(
@@ -42,6 +44,7 @@ async def main() -> None:
         fetcher=fetcher,
         parser=parser,
         summary_service=summary_service,
+        storage=storage,
         queue=QUEUE,
     )
 

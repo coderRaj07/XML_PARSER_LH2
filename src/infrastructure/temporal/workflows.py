@@ -87,7 +87,7 @@ class UrlWorkflow:
         try:
             parse_result = await workflow.execute_activity(
                 "parse_records",
-                args=[task_id, fetch_result["raw_xml"], job_id],
+                args=[task_id, fetch_result["storage_key"], job_id],
                 task_queue=PARSE_QUEUE,
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY_POLICY,
