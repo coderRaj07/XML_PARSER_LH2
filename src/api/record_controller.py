@@ -26,9 +26,11 @@ async def list_records(job_id: str, limit: int = 50, offset: int = 0) -> list[di
         job = await job_repo.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
-        records = await record_repo.list_by_job(job_id, offset=offset, limit=limit)
-        return [
-            {
+        records = await record_repo.list_by_job(job_id)
+        result = []
+        for record in records[offset:offset + limit]:
+            summary = await record_repo.get_summary(record.id)
+            result.append({
                 "id": record.id,
                 "task_id": record.task_id,
                 "title": record.title,
@@ -37,10 +39,9 @@ async def list_records(job_id: str, limit: int = 50, offset: int = 0) -> list[di
                 "source_link": record.source_link,
                 "description": _clean_html(record.description),
                 "content": _clean_html(record.content, max_len=500),
-                "summary": _clean_html(record.summary_text) if record.summary_text else None,
-            }
-            for record in records
-        ]
+                "summary": _clean_html(summary.summary_text) if summary else None,
+            })
+        return result
 
 
 @router.get("/records/{record_id}")
@@ -50,6 +51,7 @@ async def get_record(record_id: str) -> dict:
         record = await record_repo.get(record_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Record not found")
+        summary = await record_repo.get_summary(record.id)
         full_content = None
         if record.full_content:
             try:
@@ -66,5 +68,5 @@ async def get_record(record_id: str) -> dict:
             "description": _clean_html(record.description),
             "content": _clean_html(record.content),
             "full_content": full_content,
-            "summary": _clean_html(record.summary_text) if record.summary_text else None,
+            "summary": _clean_html(summary.summary_text) if summary else None,
         }

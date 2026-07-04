@@ -208,8 +208,8 @@ class SummarizeActivity:
                     )
 
                 summaries = await asyncio.gather(*[_summarize_one(r) for r in records])
-                await record_repo.save_summaries_many(summaries)
                 for summary in summaries:
+                    await record_repo.save_summary(summary)
                     logger.info("summary_completed", extra={"record_id": summary.record_id})
 
                 task.mark_completed()

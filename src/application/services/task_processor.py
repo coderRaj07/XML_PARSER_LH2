@@ -154,7 +154,7 @@ class TaskProcessor:
     async def _summarize(self, records: list[Record]) -> None:
         loop = asyncio.get_running_loop()
 
-        async def _summarize_one(record: Record) -> Summary:
+        async def _summarize_one(record: Record) -> None:
             logger.info("summary_started", extra={"record_id": record.id})
             source_text = record.content or ""
             if _is_garbage(source_text):
@@ -164,17 +164,16 @@ class TaskProcessor:
             summary_text = await loop.run_in_executor(
                 self._executor, self._summary_service.generate_summary, source_text
             )
-            return Summary(
+            summary = Summary(
                 record_id=record.id,
                 summary_text=summary_text,
                 summary_type="extractive",
                 model_used="textrank+tfidf+lsa",
             )
+            await self._record_repository.save_summary(summary)
+            logger.info("summary_completed", extra={"record_id": record.id})
 
-        summaries = await asyncio.gather(*[_summarize_one(r) for r in records])
-        await self._record_repository.save_summaries_many(summaries)
-        for summary in summaries:
-            logger.info("summary_completed", extra={"record_id": summary.record_id})
+        await asyncio.gather(*[_summarize_one(r) for r in records])
 
     async def _update_job_progress(self, task: Task) -> None:
         job = await self._job_repository.get(task.job_id)
