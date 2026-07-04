@@ -14,8 +14,7 @@ WORKFLOW_QUEUE = "xml-feed-workflow-queue"
 FETCH_QUEUE = "xml-feed-fetch-queue"
 PARSE_QUEUE = "xml-feed-parse-queue"
 SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
-MAX_CONCURRENT_URLS = 10
-BATCH_SIZE = 50
+BATCH_SIZE = 10  # keep per-batch history small; continue_as_new resets between batches
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 RETRY_POLICY = RetryPolicy(
     maximum_attempts=3,
@@ -33,14 +32,11 @@ class JobWorkflow:
         batch = tasks[:BATCH_SIZE]
         remaining = tasks[BATCH_SIZE:]
 
-        sem = asyncio.Semaphore(MAX_CONCURRENT_URLS)
-
-        async def _process_one(task_id: str, url: str) -> dict[str, Any]:
-            async with sem:
-                return await self._process_url_via_child(task_id, url, job_id)
-
         results = await asyncio.gather(
-            *[_process_one(task_id, url) for task_id, url in batch],
+            *[
+                self._process_url_via_child(task_id, url, job_id)
+                for task_id, url in batch
+            ],
             return_exceptions=True,
         )
 

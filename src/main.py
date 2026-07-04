@@ -91,7 +91,7 @@ async def get_db_repos() -> AsyncGenerator[tuple[RecordRepository, JobRepository
 
 
 @asynccontextmanager
-async def get_job_service() -> AsyncGenerator[tuple[JobService, JobRepository, TaskRepository], None]:
+async def get_job_service() -> AsyncGenerator[tuple[JobService, JobRepository], None]:
     factory = DatabaseSessionManager.get_session_factory()
     async with factory() as session:
         job_repo: JobRepository = PostgresJobRepository(session)
@@ -105,7 +105,7 @@ async def get_job_service() -> AsyncGenerator[tuple[JobService, JobRepository, T
             scheduler=scheduler,
             execution_engine=execution_engine,
         )
-        yield service, job_repo, task_repo
+        yield service, job_repo
 
 
 @asynccontextmanager
