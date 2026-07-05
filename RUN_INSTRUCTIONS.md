@@ -9,6 +9,9 @@ docker compose ps
 
 # Follow all worker logs
 docker compose logs -f workflow-worker fetch-worker parse-worker summarize-worker
+
+# remove docker cotainers with volumes
+docker compose down --volumes --remove-orphans
 ```
 
 ## Architecture
