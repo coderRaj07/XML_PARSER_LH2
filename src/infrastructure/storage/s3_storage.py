@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 from typing import Optional
@@ -50,14 +51,26 @@ class S3Storage:
 
     async def store(self, key: str, data: str) -> None:
         client = await self._get_client()
+        body = data.encode("utf-8")
         await asyncio.to_thread(
             client.put_object,
             Bucket=self._bucket,
             Key=key,
-            Body=data.encode("utf-8"),
+            Body=body,
             ContentType="application/xml",
         )
-        logger.debug("s3_store_completed", extra={"key": key, "size": len(data)})
+        logger.debug("s3_store_completed", extra={"key": key, "size": len(body)})
+
+    async def store_stream(self, key: str, data: io.IOBase, content_type: str = "application/octet-stream") -> None:
+        client = await self._get_client()
+        await asyncio.to_thread(
+            client.put_object,
+            Bucket=self._bucket,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        logger.debug("s3_store_stream_completed", extra={"key": key})
 
     async def retrieve(self, key: str) -> str:
         client = await self._get_client()
@@ -69,6 +82,21 @@ class S3Storage:
         body = response["Body"].read().decode("utf-8")
         logger.debug("s3_retrieve_completed", extra={"key": key, "size": len(body)})
         return body
+
+    async def get_bytes(self, key: str) -> bytes:
+        """Read entire S3 object into bytes (safe cross-thread)."""
+        client = await self._get_client()
+        response = await asyncio.to_thread(
+            client.get_object,
+            Bucket=self._bucket,
+            Key=key,
+        )
+        data = response["Body"].read()
+        logger.debug("s3_get_bytes", extra={"key": key, "size": len(data)})
+        return data
+
+    def _make_content_key(self, job_id: str, task_id: str, record_id: str) -> str:
+        return f"content/{job_id}/{task_id}/{record_id}.gz"
 
     def build_key(self, job_id: str, task_id: str) -> str:
         return f"feeds/{job_id}/{task_id}.xml"

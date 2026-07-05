@@ -123,7 +123,7 @@ class PostgresRecordRepository(RecordRepository):
             source_link=record.source_link,
             description=record.description,
             content=record.content,
-            full_content=record.full_content,
+            full_content_s3_key=record.full_content_s3_key,
         )
 
     @staticmethod
@@ -138,7 +138,7 @@ class PostgresRecordRepository(RecordRepository):
             source_link=model.source_link,
             description=model.description,
             content=model.content,
-            full_content=model.full_content,
+            full_content_s3_key=model.full_content_s3_key,
             summary_text=summary.summary_text if summary else None,
             summary_type=summary.summary_type if summary else None,
             model_used=summary.model_used if summary else None,

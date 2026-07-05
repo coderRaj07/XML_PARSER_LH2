@@ -1,8 +1,10 @@
 import asyncio
 import gzip
+import io
 import logging
 from asyncio import CancelledError
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from urllib.parse import urlparse
 
 import trafilatura
@@ -14,6 +16,7 @@ from src.application.strategies.parser.base_parser_strategy import ParserStrateg
 from src.domain.entities.record import Record
 from src.domain.entities.summary import Summary
 from src.domain.entities.task import Task
+from src.infrastructure.storage import S3Storage
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,7 @@ _GARBAGE_PATTERNS = [
 
 def _is_garbage(text: str) -> bool:
     import re as _re
+
     clean = _re.sub(r"<[^>]+>", "", text).strip()
     if len(clean) < 50:
         return True
@@ -45,6 +49,7 @@ class TaskProcessor:
         task_repository: TaskRepository,
         record_repository: RecordRepository,
         job_repository: JobRepository,
+        storage: Optional[S3Storage] = None,
         max_articles: int = 10,
     ) -> None:
         self._fetcher = fetcher
@@ -53,6 +58,7 @@ class TaskProcessor:
         self._task_repository = task_repository
         self._record_repository = record_repository
         self._job_repository = job_repository
+        self._storage = storage
         self._max_articles = max_articles
         self._executor = ThreadPoolExecutor(max_workers=4)
 
@@ -72,7 +78,7 @@ class TaskProcessor:
                     extra={"task_id": task.id, "original": original_count, "max": self._max_articles},
                 )
 
-            await self._fetch_full_contents(records)
+            await self._fetch_full_contents(records, task.job_id, task.id)
             await self._store_records(task, records)
             await self._summarize(records)
             task.mark_completed()
@@ -109,7 +115,7 @@ class TaskProcessor:
             r.task_id = task.id
         return records
 
-    async def _fetch_full_contents(self, records: list[Record]) -> None:
+    async def _fetch_full_contents(self, records: list[Record], job_id: str = "", task_id: str = "") -> None:
         semaphores: dict[str, asyncio.Semaphore] = {}
         CONCURRENT_PER_DOMAIN = 10
 
@@ -120,12 +126,22 @@ class TaskProcessor:
             if domain not in semaphores:
                 semaphores[domain] = asyncio.Semaphore(CONCURRENT_PER_DOMAIN)
             async with semaphores[domain]:
+                html: str | None = None
                 try:
                     html = await self._fetcher.fetch(record.source_link)
                     extracted = trafilatura.extract(html)
                     if extracted and not _is_garbage(extracted):
-                        record.full_content = gzip.compress(extracted.encode("utf-8"))
+                        compressed = gzip.compress(extracted.encode("utf-8"))
+                        if self._storage and job_id and task_id:
+                            content_key = self._storage._make_content_key(
+                                job_id, task_id, record.id
+                            )
+                            await self._storage.store_stream(
+                                content_key, io.BytesIO(compressed), "application/gzip"
+                            )
+                            record.full_content_s3_key = content_key
                         record.content = extracted
+                        del compressed
                     elif extracted:
                         logger.info(
                             "extracted_content_garbage_skipped",
@@ -136,6 +152,8 @@ class TaskProcessor:
                         "full_content_fetch_failed",
                         extra={"record_id": record.id, "url": record.source_link},
                     )
+                finally:
+                    del html
 
         coros = [_fetch_one(r) for r in records if r.source_link]
         if not coros:

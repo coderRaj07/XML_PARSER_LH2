@@ -25,6 +25,7 @@ from src.infrastructure.repositories import (
     PostgresRecordRepository,
     PostgresTaskRepository,
 )
+from src.infrastructure.storage import S3Storage
 from src.infrastructure.temporal import TemporalEngine
 
 logger = logging.getLogger(__name__)
@@ -65,11 +66,13 @@ def build_container() -> None:
     parser: ParserStrategy = RSSParser()
     summary_strategy: SummaryStrategy = ExtractiveSummaryStrategy()
     execution_engine = TemporalEngine(temporal_host=settings.temporal_host)
+    storage = S3Storage()
 
     register_service(Fetcher, fetcher)
     register_service(ParserStrategy, parser)
     register_service(SummaryStrategy, summary_strategy)
     register_service(TemporalEngine, execution_engine)
+    register_service(S3Storage, storage)
 
     # Repositories need sessions; they are created per-request, not in container.
     # The container stores factories or the services that use them.

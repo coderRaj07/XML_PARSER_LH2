@@ -1,8 +1,9 @@
-import gzip
 import html
 import re
 
 from fastapi import APIRouter, HTTPException
+
+from src.infrastructure.storage import S3Storage
 
 router = APIRouter(tags=["records"])
 
@@ -45,17 +46,22 @@ async def list_records(job_id: str, limit: int = 50, offset: int = 0) -> list[di
 
 @router.get("/records/{record_id}")
 async def get_record(record_id: str) -> dict:
-    from src.main import get_db_repos
+    from src.main import get_db_repos, get_service
     async with get_db_repos() as (record_repo, job_repo):
         record = await record_repo.get(record_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Record not found")
+
         full_content = None
-        if record.full_content:
+        if record.full_content_s3_key:
             try:
-                full_content = gzip.decompress(record.full_content).decode("utf-8")
+                storage: S3Storage = get_service(S3Storage)
+                raw = await storage.get_bytes(record.full_content_s3_key)
+                import gzip
+                full_content = gzip.decompress(raw).decode("utf-8")
             except Exception:
                 pass
+
         return {
             "id": record.id,
             "task_id": record.task_id,

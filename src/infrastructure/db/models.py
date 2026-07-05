@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -49,7 +49,7 @@ class RecordModel(Base):
     source_link: Mapped[str] = mapped_column(Text, default="")
     description: Mapped[str] = mapped_column(Text, default="")
     content: Mapped[str] = mapped_column(Text, default="")
-    full_content: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    full_content_s3_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     task: Mapped["TaskModel"] = relationship("TaskModel", back_populates="records")
     summaries: Mapped[list["SummaryModel"]] = relationship("SummaryModel", back_populates="record", cascade="all, delete-orphan")

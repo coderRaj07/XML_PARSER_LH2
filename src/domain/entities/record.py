@@ -14,7 +14,7 @@ class Record:
     description: str = ""
     content: str = ""
     source_link: str = ""
-    full_content: Optional[bytes] = None
+    full_content_s3_key: Optional[str] = None
     summary_text: Optional[str] = None
     summary_type: Optional[str] = None
     model_used: Optional[str] = None
