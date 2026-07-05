@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Optional
 
+from asyncio import Lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,9 +24,14 @@ class S3Storage:
         self._secret_access_key = secret_access_key or os.getenv("S3_SECRET_ACCESS_KEY", "minioadmin")
         self._region = region
         self._client = None
+        self._client_lock = Lock()
 
     async def _get_client(self):
-        if self._client is None:
+        if self._client is not None:
+            return self._client
+        async with self._client_lock:
+            if self._client is not None:
+                return self._client
             import boto3
 
             self._client = await asyncio.to_thread(

@@ -102,7 +102,8 @@ class ParseActivity:
 
             try:
                 raw_xml = await self._storage.retrieve(storage_key)
-                records = self._parser.parse(raw_xml)
+                loop = asyncio.get_running_loop()
+                records = await loop.run_in_executor(None, self._parser.parse, raw_xml)
                 del raw_xml
                 for r in records:
                     r.task_id = task_id
@@ -142,7 +143,8 @@ class ParseActivity:
                 html: str | None = None
                 try:
                     html = await self._fetcher.fetch(record.source_link)
-                    extracted = trafilatura.extract(html)
+                    loop = asyncio.get_running_loop()
+                    extracted = await loop.run_in_executor(None, trafilatura.extract, html)
                     if extracted and not _is_garbage(extracted):
                         compressed = gzip.compress(extracted.encode("utf-8"))
                         content_key = self._storage._make_content_key(job_id, task_id, record.id)

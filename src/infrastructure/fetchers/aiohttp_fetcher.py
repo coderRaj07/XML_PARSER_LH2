@@ -28,7 +28,7 @@ class AioHttpFetcher(Fetcher):
         max_retries: int = 3,
         backoff_base: float = 1.0,
         connector_limit: int = 100,
-        connector_limit_per_host: int = 2,
+        connector_limit_per_host: int = 10,
     ) -> None:
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
