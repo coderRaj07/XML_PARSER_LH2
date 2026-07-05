@@ -12,7 +12,7 @@ SUMMARIZE_QUEUE = os.getenv("TEMPORAL_SUMMARIZE_QUEUE", "xml-feed-summarize-queu
 
 FETCH_WORKER_COUNT = int(os.getenv("FETCH_WORKERS", "5"))
 PARSE_WORKER_COUNT = int(os.getenv("PARSE_WORKERS", "5"))
-SUMMARIZE_WORKER_COUNT = int(os.getenv("SUMMARIZE_WORKERS", "5"))
+SUMMARIZE_WORKER_COUNT = int(os.getenv("SUMMARIZE_WORKERS", str(os.cpu_count() or 4)))
 
 BATCH_SIZE = int(os.getenv("WORKFLOW_BATCH_SIZE", "50"))
 ACTIVITY_TIMEOUT = timedelta(minutes=int(os.getenv("ACTIVITY_TIMEOUT_MINUTES", "5")))
