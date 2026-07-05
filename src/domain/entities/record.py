@@ -15,3 +15,6 @@ class Record:
     content: str = ""
     source_link: str = ""
     full_content: Optional[bytes] = None
+    summary_text: Optional[str] = None
+    summary_type: Optional[str] = None
+    model_used: Optional[str] = None

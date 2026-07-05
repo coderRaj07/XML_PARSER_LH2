@@ -95,11 +95,17 @@ class RecordRepository(ABC):
         ...
 
     @abstractmethod
+    async def save_summaries_many(self, summaries: list[Summary]) -> list[Summary]:
+        ...
+
+    @abstractmethod
     async def get_summary(self, record_id: str) -> Optional[Summary]:
         ...
 
     @abstractmethod
-    async def list_by_job(self, job_id: str) -> list[Record]:
+    async def list_by_job(
+        self, job_id: str, offset: int = 0, limit: int = 100
+    ) -> list[Record]:
         ...
 
     @abstractmethod

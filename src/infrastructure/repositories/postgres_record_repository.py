@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -26,12 +26,20 @@ class PostgresRecordRepository(RecordRepository):
         return records
 
     async def list_by_task(self, task_id: str) -> list[Record]:
-        stmt = select(RecordModel).where(RecordModel.task_id == task_id)
+        stmt = (
+            select(RecordModel)
+            .where(RecordModel.task_id == task_id)
+            .options(joinedload(RecordModel.summaries))
+        )
         result = await self._session.execute(stmt)
-        return [self._to_domain(m) for m in result.scalars().all()]
+        return [self._to_domain(m) for m in result.scalars().unique().all()]
 
     async def get(self, record_id: str) -> Optional[Record]:
-        stmt = select(RecordModel).where(RecordModel.id == record_id)
+        stmt = (
+            select(RecordModel)
+            .where(RecordModel.id == record_id)
+            .options(joinedload(RecordModel.summaries))
+        )
         result = await self._session.execute(stmt)
         model = result.scalar_one_or_none()
         if model is None:
@@ -50,6 +58,23 @@ class PostgresRecordRepository(RecordRepository):
         await self._session.flush()
         return summary
 
+    async def save_summaries_many(self, summaries: list[Summary]) -> list[Summary]:
+        await self._session.execute(
+            insert(SummaryModel),
+            [
+                {
+                    "id": s.id,
+                    "record_id": s.record_id,
+                    "summary_text": s.summary_text,
+                    "summary_type": s.summary_type,
+                    "model_used": s.model_used,
+                }
+                for s in summaries
+            ],
+        )
+        await self._session.flush()
+        return summaries
+
     async def get_summary(self, record_id: str) -> Optional[Summary]:
         stmt = select(SummaryModel).where(SummaryModel.record_id == record_id)
         result = await self._session.execute(stmt)
@@ -64,12 +89,16 @@ class PostgresRecordRepository(RecordRepository):
             model_used=model.model_used,
         )
 
-    async def list_by_job(self, job_id: str) -> list[Record]:
+    async def list_by_job(
+        self, job_id: str, offset: int = 0, limit: int = 50
+    ) -> list[Record]:
         stmt = (
             select(RecordModel)
             .join(TaskModel, TaskModel.id == RecordModel.task_id)
             .where(TaskModel.job_id == job_id)
             .options(joinedload(RecordModel.summaries))
+            .offset(offset)
+            .limit(limit)
         )
         result = await self._session.execute(stmt)
         return [self._to_domain(m) for m in result.scalars().unique().all()]
@@ -99,6 +128,7 @@ class PostgresRecordRepository(RecordRepository):
 
     @staticmethod
     def _to_domain(model: RecordModel) -> Record:
+        summary = model.summaries[0] if model.summaries else None
         return Record(
             id=model.id,
             task_id=model.task_id,
@@ -109,4 +139,7 @@ class PostgresRecordRepository(RecordRepository):
             description=model.description,
             content=model.content,
             full_content=model.full_content,
+            summary_text=summary.summary_text if summary else None,
+            summary_type=summary.summary_type if summary else None,
+            model_used=summary.model_used if summary else None,
         )
