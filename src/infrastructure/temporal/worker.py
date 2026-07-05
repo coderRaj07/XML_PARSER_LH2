@@ -15,11 +15,13 @@ from src.infrastructure.temporal.config import (
     PARSE_WORKER_COUNT,
     SUMMARIZE_WORKER_COUNT,
 )
-from src.infrastructure.temporal.workflows import (
+from src.infrastructure.temporal.config import (
     FETCH_QUEUE,
     PARSE_QUEUE,
     SUMMARIZE_QUEUE,
     WORKFLOW_QUEUE,
+)
+from src.infrastructure.temporal.workflows import (
     JobWorkflow,
     UrlWorkflow,
 )

@@ -1,54 +1,82 @@
 import asyncio
-from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
+from temporalio.common import WorkflowIDReusePolicy
 
-with workflow.unsafe.imports_passed_through():
-    pass
-
-WORKFLOW_NAME = "job-workflow"
-CHILD_WORKFLOW_NAME = "url-workflow"
-WORKFLOW_QUEUE = "xml-feed-workflow-queue"
-FETCH_QUEUE = "xml-feed-fetch-queue"
-PARSE_QUEUE = "xml-feed-parse-queue"
-SUMMARIZE_QUEUE = "xml-feed-summarize-queue"
-MAX_CONCURRENT_URLS = 10
-BATCH_SIZE = 50
-ACTIVITY_TIMEOUT = timedelta(minutes=5)
-RETRY_POLICY = RetryPolicy(
-    maximum_attempts=3,
-    initial_interval=timedelta(seconds=1),
-    maximum_interval=timedelta(seconds=30),
-    backoff_coefficient=2.0,
+from src.infrastructure.temporal.config import (
+    ACTIVITY_TIMEOUT,
+    BATCH_GATHER_TIMEOUT,
+    BATCH_SIZE,
+    CHILD_WORKFLOW_TIMEOUT,
+    FETCH_QUEUE,
+    MAX_CONCURRENT_URLS,
+    PARSE_QUEUE,
+    SUMMARIZE_QUEUE,
+    WORKFLOW_QUEUE,
+    WORKFLOW_NAME,
+    RETRY_POLICY,
 )
-CHILD_WORKFLOW_TIMEOUT = timedelta(minutes=30)
+
+CHILD_WORKFLOW_NAME = "url-workflow"
 
 
 @workflow.defn(name=WORKFLOW_NAME)
 class JobWorkflow:
     @workflow.run
     async def run(self, job_id: str, tasks: list[tuple[str, str]]) -> dict[str, Any]:
+        if not tasks:
+            return {"job_id": job_id, "total": 0, "completed": 0, "failed": 0}
+
         batch = tasks[:BATCH_SIZE]
         remaining = tasks[BATCH_SIZE:]
 
-        sem = asyncio.Semaphore(MAX_CONCURRENT_URLS)
-
-        async def _process_one(task_id: str, url: str) -> dict[str, Any]:
-            async with sem:
-                return await self._process_url_via_child(task_id, url, job_id)
-
-        results = await asyncio.gather(
-            *[_process_one(task_id, url) for task_id, url in batch],
-            return_exceptions=True,
-        )
+        handles = []
+        for task_id, url in batch:
+            try:
+                handle = await workflow.start_child_workflow(
+                    CHILD_WORKFLOW_NAME,
+                    args=[task_id, url, job_id],
+                    id=f"{job_id}/url/{task_id}",
+                    task_queue=WORKFLOW_QUEUE,
+                    execution_timeout=CHILD_WORKFLOW_TIMEOUT,
+                    id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                )
+                handles.append(handle)
+            except Exception:
+                pass
 
         if remaining:
             workflow.continue_as_new(args=[job_id, remaining])
 
-        completed = sum(1 for r in results if not isinstance(r, Exception) and r.get("status") == "completed")
-        failed = sum(1 for r in results if isinstance(r, Exception) or r.get("status") == "failed")
+        sem = asyncio.Semaphore(MAX_CONCURRENT_URLS)
+
+        async def _await_handle(h: Any) -> dict[str, Any]:
+            async with sem:
+                return await h
+
+        coros = [_await_handle(h) for h in handles]
+        futures = [asyncio.create_task(c) for c in coros]
+        done, pending = await asyncio.wait(futures, timeout=BATCH_GATHER_TIMEOUT.total_seconds())
+
+        results: list[Any] = []
+        for task in done:
+            try:
+                results.append(task.result())
+            except Exception as e:
+                results.append(e)
+        for task in pending:
+            task.cancel()
+            results.append({"status": "failed", "error": "batch_gather_timeout"})
+
+        completed = sum(
+            1 for r in results
+            if isinstance(r, dict) and r.get("status") == "completed"
+        )
+        failed = sum(
+            1 for r in results
+            if isinstance(r, Exception) or (isinstance(r, dict) and r.get("status") == "failed")
+        )
 
         return {
             "job_id": job_id,
@@ -56,19 +84,6 @@ class JobWorkflow:
             "completed": completed,
             "failed": failed,
         }
-
-    async def _process_url_via_child(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
-        try:
-            result = await workflow.execute_child_workflow(
-                CHILD_WORKFLOW_NAME,
-                args=[task_id, url, job_id],
-                id=f"{job_id}/url/{task_id}",
-                task_queue=WORKFLOW_QUEUE,
-                execution_timeout=CHILD_WORKFLOW_TIMEOUT,
-            )
-            return result
-        except Exception as e:
-            return {"task_id": task_id, "status": "failed", "error": str(e)}
 
 
 @workflow.defn(name=CHILD_WORKFLOW_NAME)

@@ -4,7 +4,7 @@ from typing import Any
 from temporalio.client import Client
 
 from src.application.interfaces.execution_engine import ExecutionEngine
-from src.infrastructure.temporal.workflows import WORKFLOW_NAME, WORKFLOW_QUEUE
+from src.infrastructure.temporal.config import WORKFLOW_NAME, WORKFLOW_QUEUE
 
 logger = logging.getLogger(__name__)
 
