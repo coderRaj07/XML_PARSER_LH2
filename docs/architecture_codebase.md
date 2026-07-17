@@ -69,50 +69,61 @@ POST /jobs {"urls": [...101 URLs...]}
          │    start_child_workflow("url-workflow")         │
          │      ↳ non-blocking, returns handle instantly   │
          │      ↳ id = "{job_id}/url/{task_id}"            │
-         │      ↳ REJECT_DUPLICATE policy                  │
+         │      ↳ ALLOW_DUPLICATE_FAILED_ONLY policy       │
+         │                                                 │
+         │  asyncio.gather(children, Semaphore(10))        │
+         │    ↳ awaits ALL children in this batch          │
+         │    ↳ throttled by Semaphore(MAX_CONCURRENT_URLS)│
+         │    ↳ collects completed/failed counts           │
          │                                                 │
          │  IF remaining:                                  │
          │    workflow.continue_as_new(args=[job_id,       │
-         │                                  remaining])    │
+         │                 remaining, completed, failed])  │
          │    ↳ TERMINAL - current execution ends          │
          │    ↳ new execution starts with remaining tasks  │
          │                                                 │
-         │  asyncio.wait(futures, timeout=BATCH_GATHER)    │
-         │    ↳ waits for THIS batch's children only       │
-         │    ↳ done tasks: collect results                │
-         │    ↳ pending tasks: cancel, count as failed     │
+         │  ELSE: return final results                     │
          └─────────────────────────────────────────────────┘
                         │
                         │  (per child workflow)
                         ▼
          ┌─── UrlWorkflow.run() ──────────────────────────────┐
          │                                                     │
-         │  Activity 1: fetch_url (FETCH_QUEUE)                │
-         │    ↳ aiohttp fetch URL                              │
-         │    ↳ store raw XML in MinIO                         │
-         │    ↳ timeout: 60s, retry: 1                         │
+         │  try:                                               │
+         │    Activity 1: fetch_url (FETCH_QUEUE)               │
+         │      ↳ aiohttp fetch URL                            │
+         │      ↳ store raw XML in MinIO                       │
+         │      ↳ timeout: 60s, retry: 1                       │
          │                                                     │
-         │  Activity 2: parse_records (PARSE_QUEUE)            │
-         │    ↳ retrieve XML from MinIO                        │
-         │    ↳ feedparser.parse() → Records (metadata only)   │
-         │    ↳ save Records to DB                             │
-         │    ↳ returns record_infos [{id, source_link}]       │
-         │    ↳ timeout: 60s, retry: 1                         │
+         │    Activity 2: parse_records (PARSE_QUEUE)           │
+         │      ↳ retrieve XML from MinIO                      │
+         │      ↳ feedparser.parse() → Records (metadata only) │
+         │      ↳ save Records to DB                           │
+         │      ↳ returns record_infos [{id, source_link}]     │
+         │      ↳ timeout: 60s, retry: 1                       │
          │                                                     │
-         │  Child Workflow: EnrichmentWorkflow (ENRICHMENT_Q)  │
-         │    ↳ parallel fetch_article per record:             │
-         │      - trafilatura.extract() → content              │
-         │      - gzip + store in MinIO                        │
-         │      - update record.content + s3_key in DB         │
-         │    ↳ timeout: 5 min, retry: 1                       │
+         │    Child Workflow: EnrichmentWorkflow (ENRICHMENT_Q) │
+         │      ↳ parallel fetch_article per record (batched): │
+         │        - trafilatura.extract() → content            │
+         │        - gzip + store in MinIO                      │
+         │        - update record.content + s3_key in DB       │
+         │      ↳ timeout: dynamic (30s × article count, cap 300s)│
          │                                                     │
-         │  Activity 3: summarize_records (SUMMARIZE_QUEUE)    │
-         │    ↳ read Records from DB                           │
-         │    ↳ TextRank → TF-IDF → LSA → fallback             │ 
-         │    ↳ save Summaries to DB                           │
-         │    ↳ mark task COMPLETED in DB                      │
-         │    ↳ update job progress in DB                      │
-         │    ↳ timeout: 60s, retry: 1                         │
+         │    Activity 3: summarize_records (SUMMARIZE_QUEUE)   │
+         │      ↳ read Records from DB                         │
+         │      ↳ TextRank → TF-IDF → LSA → fallback          │
+         │      ↳ save Summaries to DB                         │
+         │      ↳ mark task COMPLETED → commit (session 1)     │
+         │      ↳ count tasks → update job (session 2)         │
+         │      ↳ timeout: 60s, retry: 1                       │
+         │                                                     │
+         │  finally:                                           │
+         │    Activity: finalize_task (URL_WORKFLOW_QUEUE)      │
+         │      ↳ if task still "pending":                     │
+         │          has records+summaries → mark completed      │
+         │          no summaries → mark failed                  │
+         │      ↳ updates job progress                         │
+         │      ↳ timeout: 30s                                 │
          └─────────────────────────────────────────────────────┘
                         │
                         ▼
@@ -130,15 +141,17 @@ POST /jobs {"urls": [...101 URLs...]}
 **How it works:**
 
 1. `JobWorkflow` takes first 50 tasks, starts them as child workflows via `workflow.start_child_workflow()` (non-blocking)
-2. Calls `workflow.continue_as_new(args=[job_id, remaining_51])` -- this **terminates** the current workflow execution immediately
-3. Temporal creates a fresh workflow execution with the 51 remaining tasks
-4. The 50 already-started children run independently on Temporal -- they are NOT killed by `continue_as_new`
-5. Next execution: batch 51, start 50 more children, `continue_as_new` with 1 remaining
-6. Last execution: batch 1, start 1 child, wait for it, return results
+2. Awaits all children in the batch via `asyncio.gather()` with a `Semaphore(MAX_CONCURRENT_URLS=10)` to limit concurrent awaits
+3. Counts completed/failed results across the batch
+4. Calls `workflow.continue_as_new(args=[job_id, remaining_51, completed, failed])` -- this **terminates** the current workflow execution immediately
+5. Temporal creates a fresh workflow execution with the 51 remaining tasks and accumulated counts
+6. The 50 already-started children run independently on Temporal -- they are NOT killed by `continue_as_new`
+7. Next execution: batch 51, start 50 more children, await, continue_as_new with 1 remaining
+8. Last execution: batch 1, start 1 child, wait for it, return final results
 
-**Why non-blocking `start_child_workflow`:** The old code used `execute_child_workflow` (blocking) + `asyncio.gather` before `continue_as_new`. If any child hung, `continue_as_new` never fired and the remaining batch was stranded. Now children are started without waiting.
+**Why non-blocking `start_child_workflow` + `asyncio.gather`:** Children are started without waiting (non-blocking). After all children in the batch are started, `asyncio.gather` awaits them all with a semaphore for throttling. Results (completed/failed counts) are accumulated and passed to `continue_as_new` so the final execution knows the total.
 
-**`REJECT_DUPLICATE` policy:** If the workflow worker restarts mid-batch, `start_child_workflow` with the same ID won't create duplicates.
+**`ALLOW_DUPLICATE_FAILED_ONLY` policy:** If the workflow worker restarts mid-batch, `start_child_workflow` with the same ID won't create duplicates for successful workflows, but will allow retrying failed ones.
 
 ---
 
@@ -147,9 +160,9 @@ POST /jobs {"urls": [...101 URLs...]}
 | Timeout | Value | Where Set | Purpose |
 |---------|-------|-----------|---------|
 | `ACTIVITY_TIMEOUT` | **60s** | `config.py` env `ACTIVITY_TIMEOUT_SECONDS` | `start_to_close_timeout` on each Temporal activity. If an activity runs longer, Temporal kills it and retries. |
-| `CHILD_WORKFLOW_TIMEOUT` | **180s** (derived) | `config.py` = `ACTIVITY_TIMEOUT × MAX_ACTIVITY_RETRIES × NUM_ACTIVITIES` | `execution_timeout` on each UrlWorkflow child. Derived to guarantee every activity can exhaust all retries before the child is killed. |
-| `ENRICHMENT_CHILD_TIMEOUT` | **5 min** | `workflows.py:125` | `execution_timeout` on EnrichmentWorkflow child. Hardcoded since enrichment has many parallel activities. |
-| `BATCH_GATHER_TIMEOUT` | **15s** | `config.py` env `BATCH_GATHER_TIMEOUT_SECONDS` | `asyncio.wait(timeout=...)` on the last batch's gather. If children don't finish in time, pending tasks are cancelled. |
+| `CHILD_WORKFLOW_TIMEOUT` | **540s** (derived) | `config.py` = `activity_budget + ENRICHMENT_TIMEOUT_BUDGET + 60s` | `execution_timeout` on each UrlWorkflow child. Includes enrichment budget (300s) so parent never kills child before enrichment completes. |
+| `ENRICHMENT_CHILD_TIMEOUT` | **dynamic** | `workflows.py` = `min(record_count × 30, 300)` | `execution_timeout` on EnrichmentWorkflow child. Scales with article count (30s per article), capped at 300s. |
+| `BATCH_GATHER_TIMEOUT` | **15s** | `config.py` env `BATCH_GATHER_TIMEOUT_SECONDS` | Defined in config but **not currently used** in workflows. Previously used for `asyncio.wait` timeout on batch gather. |
 | `MAX_ACTIVITY_RETRIES` | **1** | `config.py` env `ACTIVITY_MAX_RETRIES` | Each activity gets only 1 attempt. Combined with 60s timeout = 60s worst-case per activity. |
 | aiohttp default | **30s** | `aiohttp_fetcher.py` | Total timeout per HTTP fetch request for RSS feeds and article content. |
 | aiohttp YouTube | **10s** | `aiohttp_fetcher.py` | Reduced timeout specifically for YouTube RSS feeds. |
@@ -164,35 +177,27 @@ POST /jobs {"urls": [...101 URLs...]}
 ## All Asyncio Patterns
 
 ### `workflow.start_child_workflow()` (non-blocking)
-**File:** `workflows.py:37-44`
+**File:** `workflows.py:48-56`
 Fires off a child workflow and returns a handle immediately without waiting for completion. This is the key fix -- the old `execute_child_workflow` blocked until the child finished.
 
 ### `workflow.continue_as_new()`
-**File:** `workflows.py:50`
+**File:** `workflows.py:89`
 Terminates the current workflow execution and starts a new one with the given args. The new execution gets a clean history. The old execution's children continue running independently.
 
-### `asyncio.Semaphore(10)`
-**File:** `workflows.py:52`
-Limits how many child workflow handles we await concurrently in the last batch. Prevents overwhelming the workflow worker.
-
-### `asyncio.create_task()`
-**File:** `workflows.py:59`
-Wraps coroutines into futures for use with `asyncio.wait`.
-
-### `asyncio.wait(futures, timeout=180)`
-**File:** `workflows.py:60`
-Waits for batch completion with a hard timeout. Returns `(done, pending)` sets. Pending tasks are cancelled.
+### `asyncio.Semaphore(MAX_CONCURRENT_URLS)`
+**File:** `workflows.py:64`
+Limits how many child workflow handles we await concurrently (default 10). Prevents overwhelming the workflow worker.
 
 ### `asyncio.gather(*coros, return_exceptions=True)`
-**File:** `activities.py:173` (full-content fetch), `activities.py:223` (summarize)
+**File:** `workflows.py:72` (JobWorkflow batch gather), `workflows.py:217` (EnrichmentWorkflow), `activities.py:241` (summarize)
 Runs multiple coroutines concurrently. `return_exceptions=True` means exceptions become results instead of cancelling everything.
 
 ### `loop.run_in_executor(None, func, arg)`
-**File:** `activities.py:106,147`
+**File:** `activities.py:102,159`
 Offloads CPU-bound synchronous work (feedparser.parse, trafilatura.extract) to the default thread pool. Used because these libraries are synchronous.
 
 ### `loop.run_in_executor(self._executor, func, arg)`
-**File:** `activities.py:213-214`
+**File:** `activities.py:225-226`
 Offloads CPU-bound summarization (TextRank/TF-IDF/LSA) to a **dedicated** `ThreadPoolExecutor(max_workers=4)`. Separate from default pool because summarization is expensive.
 
 ### `asyncio.to_thread(boto3_func, ...)`
@@ -208,7 +213,7 @@ Ensures only one coroutine initializes the boto3 S3 client. First check without 
 Exponential backoff between HTTP fetch retries.
 
 ### `asyncio.create_task(w.run())`
-**File:** `worker.py:49,61,73,85`
+**File:** `worker.py:53,65,78,90,102,114`
 Starts the Temporal worker as a background task within the asyncio event loop.
 
 ---
@@ -217,9 +222,9 @@ Starts the Temporal worker as a background task within the asyncio event loop.
 
 | Pattern | Location | Details |
 |---------|----------|---------|
-| `ThreadPoolExecutor(max_workers=4)` | `activities.py:189` | Dedicated executor for CPU-bound summarization (TextRank + TF-IDF + LSA). Shared across all concurrent summarize activities in a worker process. |
-| `loop.run_in_executor(None, ...)` | `activities.py:106,147` | Default executor (unlimited threads) for feedparser.parse and trafilatura.extract. These are fast I/O-bound-to-CPU-bound operations. |
-| `loop.run_in_executor(self._executor, ...)` | `activities.py:213-214` | Dedicated 4-thread pool for summarization. Prevents summarization from starving other work. |
+| `ThreadPoolExecutor(max_workers=4)` | `activities.py:201` | Dedicated executor for CPU-bound summarization (TextRank + TF-IDF + LSA). Shared across all concurrent summarize activities in a worker process. |
+| `loop.run_in_executor(None, ...)` | `activities.py:102,159` | Default executor (unlimited threads) for feedparser.parse and trafilatura.extract. These are fast I/O-bound-to-CPU-bound operations. |
+| `loop.run_in_executor(self._executor, ...)` | `activities.py:225-226` | Dedicated 4-thread pool for summarization. Prevents summarization from starving other work. |
 | `asyncio.to_thread(...)` | `s3_storage.py` (all S3 ops) | Every boto3 call (put_object, get_object, list_buckets, create_bucket) runs in a thread. boto3 is synchronous. |
 
 ---
@@ -343,7 +348,7 @@ S3 client is created on first use via double-checked locking (`asyncio.Lock()`).
 
 ### Retry Chain
 
-Combined fetcher-level + Temporal-level retries: up to **3 x 3 = 9** total attempts per URL. However, 403/404/410 failures are permanent and fail immediately at the fetcher level (1 attempt only).
+Combined fetcher-level + Temporal-level retries: up to **3 x 1 = 3** total attempts per URL. However, 403/404/410 failures are permanent and fail immediately at the fetcher level (1 attempt only). With `MAX_ACTIVITY_RETRIES=1`, Temporal does not retry — the fetcher handles all retries internally.
 
 ---
 
@@ -420,13 +425,14 @@ All strategies target `sentences_count=5` (configurable). Source text for summar
 | `ENRICHMENT_WORKFLOW_NAME` | `"enrichment-workflow"` | -- |
 | `ENRICHMENT_QUEUE` | `"xml-feed-enrichment-queue"` | `TEMPORAL_ENRICHMENT_QUEUE` |
 | `ENRICHMENT_WORKER_COUNT` | `5` | `ENRICHMENT_WORKERS` |
+| `ENRICHMENT_TIMEOUT_BUDGET` | `300` | -- |
 | `FETCH_WORKER_COUNT` | `5` | `FETCH_WORKERS` |
 | `PARSE_WORKER_COUNT` | `5` | `PARSE_WORKERS` |
 | `SUMMARIZE_WORKER_COUNT` | `os.cpu_count() or 4` | `SUMMARIZE_WORKERS` |
 | `BATCH_SIZE` | `50` | `WORKFLOW_BATCH_SIZE` |
 | `MAX_CONCURRENT_URLS` | `10` | `MAX_CONCURRENT_URLS` |
 | `ACTIVITY_TIMEOUT` | `60s` | `ACTIVITY_TIMEOUT_SECONDS` |
-| `CHILD_WORKFLOW_TIMEOUT` | `180s derived` | -- |
+| `CHILD_WORKFLOW_TIMEOUT` | `540s derived` | -- |
 | `BATCH_GATHER_TIMEOUT` | `15s` | `BATCH_GATHER_TIMEOUT_SECONDS` |
 | `MAX_ACTIVITY_RETRIES` | `1` | `ACTIVITY_MAX_RETRIES` |
 | `RETRY_POLICY.initial_interval` | `1s` | -- |
@@ -477,7 +483,7 @@ All strategies target `sentences_count=5` (configurable). Source text for summar
 |----------|-------|
 | `max_articles` | 10 (constructor default) |
 | `ThreadPoolExecutor(max_workers)` | 4 |
-| `CONCURRENT_PER_DOMAIN` | 10 |
+| `ENRICHMENT_BATCH_SIZE` | 5 (workflows.py) |
 | Garbage detection min length | 50 chars |
 
 ---
@@ -515,10 +521,10 @@ All strategies target `sentences_count=5` (configurable). Source text for summar
 | `src/infrastructure/repositories/postgres_record_repository.py` | 145 | Record CRUD + summaries |
 | `src/infrastructure/fetchers/aiohttp_fetcher.py` | 109 | Async HTTP with retry, backoff, permanent failure detection |
 | `src/infrastructure/storage/s3_storage.py` | 109 | MinIO S3 storage, lazy client init |
-| `src/infrastructure/temporal/config.py` | 27 | All Temporal constants with env var overrides |
-| `src/infrastructure/temporal/workflows.py` | 129 | `JobWorkflow` (batched fire-and-forget), `UrlWorkflow` (fetch → parse → enrichment child → summarize), `EnrichmentWorkflow` (parallel article fetch) |
-| `src/infrastructure/temporal/activities.py` | 253 | `FetchActivity`, `ParseActivity`, `EnrichmentActivity`, `SummarizeActivity` |
-| `src/infrastructure/temporal/worker.py` | 90 | Worker process launcher per queue |
+| `src/infrastructure/temporal/config.py` | 52 | All Temporal constants with env var overrides |
+| `src/infrastructure/temporal/workflows.py` | 232 | `JobWorkflow` (batched start-then-gather), `UrlWorkflow` (fetch → parse → enrichment child → summarize → finalize), `EnrichmentWorkflow` (batched parallel article fetch) |
+| `src/infrastructure/temporal/activities.py` | 345 | `FetchActivity`, `ParseActivity`, `EnrichmentActivity`, `SummarizeActivity`, `FinalizeTaskActivity` |
+| `src/infrastructure/temporal/worker.py` | 119 | Worker process launcher per queue |
 | `src/infrastructure/temporal/temporal_engine.py` | 43 | Starts workflows on Temporal |
 | `src/infrastructure/temporal/run_worker.py` | 53 | CLI entry point for worker processes |
 

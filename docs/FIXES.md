@@ -110,7 +110,7 @@
 
 ---
 
-## 12. Large Payload Exceeds Temporal gRPC Message Limit
+## 11. Large Payload Exceeds Temporal gRPC Message Limit
 
 **Issue:** FetchActivity returns raw XML as part of its result (`{"task_id": task_id, "raw_xml": raw_xml}`), which is then passed as an argument to ParseActivity via `fetch_result["raw_xml"]`. For feeds with large RSS/XML payloads, this can exceed Temporal's default 4 MB gRPC message size limit, causing:
 
@@ -142,7 +142,7 @@ FetchActivity → stores raw_xml in DB → returns task_id → workflow → pass
 
 ---
 
-## 11. Temporal Activity Never Dispatched
+## 12. Temporal Activity Never Dispatched
 
 **Issue:** After worker restart, some activities in the `asyncio.gather` were never dispatched. The task stayed "pending" with 0 attempts indefinitely.
 
@@ -152,7 +152,7 @@ FetchActivity → stores raw_xml in DB → returns task_id → workflow → pass
 
 ---
 
-## 12. Race Condition: Multiple Containers Calling `Base.metadata.create_all()` on Startup
+## 13. Race Condition: Multiple Containers Calling `Base.metadata.create_all()` on Startup
 
 **Issue:** On startup, all 5 containers (`app`, `workflow-worker`, `fetch-worker`, `parse-worker`, `summarize-worker`) simultaneously called `await Base.metadata.create_all()` inside `DatabaseSessionManager.create_tables()`. This is a classic TOCTOU (Time-of-Check to Time-of-Use) race condition: each container's connection checked "do the tables exist?", saw "no", then all tried to create them simultaneously. PostgreSQL's `pg_type_typname_nsp_index` unique constraint caught the duplicate `CREATE TYPE` and raised:
 ```
@@ -176,7 +176,7 @@ This was **not** a PostgreSQL bug — it was an application-level race from mult
 
 ---
 
-## 13. Parse Activity Doing Too Much (XML Parsing + Enrichment + S3 Upload in One Activity)
+## 14. Parse Activity Doing Too Much (XML Parsing + Enrichment + S3 Upload in One Activity)
 
 **Issue:** The `parse_records` activity was responsible for: (1) reading XML from S3, (2) parsing with feedparser, (3) fetching full article content for every record via trafilatura, (4) uploading to S3, (5) saving records to DB. For feeds with 10-20 articles, this single activity ran for 30-60+ seconds. Combined with the `CHILD_WORKFLOW_TIMEOUT` of 45 seconds (derived from `ACTIVITY_TIMEOUT=15s × 3 retries × 3 activities = 135s`), activities would be killed before completing, leaving records in an inconsistent state. Additionally, a failure in any one article's enrichment would fail the entire batch.
 
@@ -209,3 +209,133 @@ UrlWorkflow:
 ```
 
 **Files:** `src/infrastructure/temporal/activities.py`, `src/infrastructure/temporal/workflows.py`, `src/infrastructure/temporal/worker.py`, `src/infrastructure/temporal/config.py`, `src/infrastructure/repositories/postgres_record_repository.py`, `src/application/interfaces/repositories.py`, `docker-compose.yml`
+
+---
+
+## 15. Enrichment Workflow Overload (`Workflow is busy`)
+
+**Issue:** `EnrichmentWorkflow` launched ALL `fetch_article` activities at once via `asyncio.gather()`. For feeds with 10-20 articles, this meant 10-20 activity completions hit the parent `UrlWorkflow` simultaneously, causing `serviceerror.ResourceExhausted: Workflow is busy` errors. Temporal's workflow task queue can only process one workflow task at a time per workflow, so too many concurrent completions overwhelm it.
+
+**Fix:** Batch enrichment activities in groups of 5 (`ENRICHMENT_BATCH_SIZE = 5`). Each batch completes before the next starts. This limits concurrent completions to 5 at a time.
+
+**Before:** 20 activities launched simultaneously → 20 completions overwhelm workflow task handler
+**After:** 4 batches of 5 → 5 completions per batch, manageable by workflow
+
+**Files:** `src/infrastructure/temporal/workflows.py:148` (`ENRICHMENT_BATCH_SIZE`), `EnrichmentWorkflow.run()`
+
+---
+
+## 16. Child Workflow Timeout Mismatch (`InvalidStateError: Result is not set`)
+
+**Issue:** `UrlWorkflow` started an `EnrichmentWorkflow` child and called `await enrichment_handle.result()`. But `CHILD_WORKFLOW_TIMEOUT` (180s) was shorter than the enrichment child's maximum time (up to 300s for 20 articles). When the parent timed out, the child was abandoned, and `result()` threw `InvalidStateError: Result is not set`.
+
+Additionally, `summarize_records` reads `record.content` — the field enrichment populates. So fire-and-forget (not awaiting enrichment) would produce stale summaries from empty content. The pipeline must remain sequential: enrichment completes → then summarize reads from DB.
+
+**Fix:** Updated `CHILD_WORKFLOW_TIMEOUT` derivation to account for enrichment:
+
+```python
+ENRICHMENT_TIMEOUT_BUDGET = 300  # max 20 articles × 15s each
+_activity_budget = ACTIVITY_TIMEOUT * MAX_ACTIVITY_RETRIES * NUM_ACTIVITIES  # 180s
+_child_timeout_seconds = _activity_budget + ENRICHMENT_TIMEOUT_BUDGET + 60    # 540s
+```
+
+Now `CHILD_WORKFLOW_TIMEOUT = 540s` (9 minutes), which is always greater than the enrichment child's maximum (300s) plus activity budget (180s) plus safety margin (60s).
+
+**Files:** `src/infrastructure/temporal/config.py:42-45`
+
+---
+
+## 17. Job Status Stuck at `running` After All Workflows Complete (SQL COUNT Race Condition)
+
+**Issue:** API returned `{"status": "running", "completed": 52, "failed": 48}` for 101 tasks (52+48=100 ≠ 101), but Temporal UI showed **no running workflows**. All workflows had completed. The bug was in `SummarizeActivity.summarize_records()`:
+
+```python
+task.mark_completed()
+await task_repo.update(task)        # flushes but doesn't commit
+# ... same session ...
+pending, completed, failed = await task_repo.count_by_status(job_id)  # SQL COUNT
+# COUNT only sees committed data — misses the flush above
+```
+
+Two concurrent `summarize_records` activities run SQL COUNT in separate sessions. Activity A flushes task as "completed" but doesn't commit. Activity B's COUNT doesn't see it. The counts are always one behind. The final activity's count never reaches `total_tasks`, so `job.update_progress()` never sets status to COMPLETED.
+
+**Fix (two layers):**
+
+1. **Root cause** (`activities.py`): Split task commit and job update into separate sessions. First commit the task status (persisted), then in a new session, count tasks and update the job. The COUNT now sees committed data.
+
+2. **Safety net** (`job_controller.py`): `get_job` now derives status from actual task counts. If `pending == 0` and `completed + failed >= total_tasks`, the job is shown as "completed" regardless of what the jobs table says.
+
+**Before:**
+```
+summarize_records:
+  task.mark_completed()
+  session.flush()           # not committed yet
+  count_by_status()         # SQL COUNT misses uncommitted data
+  job.update_progress()     # never reaches total_tasks
+  session.commit()          # too late — count was wrong
+```
+
+**After:**
+```
+summarize_records:
+  session 1: task.mark_completed() → session.commit()  # persisted
+  session 2: count_by_status() → job.update_progress() → session.commit()  # sees committed data
+
+get_job (API):
+  if pending == 0 and completed + failed >= total_tasks:
+      actual_status = "completed"   # safety net
+```
+
+**Files:** `src/infrastructure/temporal/activities.py:252-264` (success path), `src/infrastructure/temporal/activities.py:272-291` (failure path), `src/api/job_controller.py:39-42`
+
+---
+
+## 18. Task Left Pending After Workflow Termination (FinalizeTaskActivity)
+
+**Issue:** If a `UrlWorkflow` was terminated (e.g., parent timeout, worker crash, cancellation) before the task got properly finalized, the task remained stuck in "pending" status forever. The `summarize_records` activity was the only one that marked tasks as completed, so if the workflow failed before reaching that step, the task was orphaned.
+
+**Fix:** Introduced `FinalizeTaskActivity` — a safety-net activity that runs in `UrlWorkflow`'s `finally` block (always executes, regardless of how the workflow terminates). It:
+
+1. Checks if the task is still "pending"
+2. If the task has records with summaries → marks it "completed"
+3. If the task has no summaries → marks it "failed" with message "Workflow terminated before task was finalized"
+4. Updates job progress via a separate DB session
+
+**Before:**
+```
+UrlWorkflow:
+  1. fetch_url → success
+  2. parse_records → success
+  3. EnrichmentWorkflow → timeout/crash
+  4. summarize_records → never reached
+  → Task stuck as "pending" forever
+```
+
+**After:**
+```
+UrlWorkflow:
+  try:
+    1. fetch_url
+    2. parse_records
+    3. EnrichmentWorkflow (child)
+    4. summarize_records
+  finally:
+    5. finalize_task → if still pending, finalize based on records/summaries
+```
+
+**Files:** `src/infrastructure/temporal/activities.py:300-345` (FinalizeTaskActivity), `src/infrastructure/temporal/workflows.py:106-115` (finally block), `src/infrastructure/temporal/worker.py:58-63` (activity registration)
+
+---
+
+## 19. `list_tasks` Endpoint Returns Stale "pending" Status for Completed Tasks
+
+**Issue:** The `GET /jobs/{job_id}/tasks` endpoint returned tasks with `status: "pending"` even when they had been processed. This happened because the task's `status` field in the DB was not always updated (e.g., due to Fix #17 scenarios or race conditions), but the task's records and summaries existed.
+
+**Fix:** `list_tasks` now performs a runtime check for "pending" tasks: it queries the task's records and their summaries to derive a more accurate status:
+- If records exist **and** at least one has a summary → reported as "completed"
+- If records exist but no summaries → reported as "failed"
+- Otherwise remains "pending"
+
+This parallels the `get_job` safety net (Fix #16) which derives job-level status from task counts.
+
+**Files:** `src/api/job_controller.py:51-76`

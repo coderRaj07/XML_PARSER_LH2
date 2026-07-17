@@ -2,7 +2,7 @@
 
 ## How many workers are we using?
 
-**6 queues, each with `max_concurrent_activities=5`.** Each queue runs in its own Docker container with its own OS process and event loop:
+**6 queues, each running in its own Docker container with its own OS process and event loop.** Activity concurrency varies per queue (configurable via env vars):
 
 | Queue | Process | Role |
 |-------|---------|------|
@@ -13,14 +13,14 @@
 | `xml-feed-enrichment-queue` | N `enrichment-worker` containers | Per-article full content fetch + trafilatura + S3 upload; also runs EnrichmentWorkflow |
 | `xml-feed-summarize-queue` | N `summarize-worker` containers | Generates summaries, updates task/job status (CPU-bound) |
 
-Each worker runs `max_concurrent_activities=5` (configurable via `FETCH_WORKERS`, `PARSE_WORKERS`, `ENRICHMENT_WORKERS`, `SUMMARIZE_WORKERS` env vars).
+Activity concurrency per worker is configurable via `FETCH_WORKERS`, `PARSE_WORKERS`, `ENRICHMENT_WORKERS`, `SUMMARIZE_WORKERS` env vars. Docker defaults: fetch=50, parse=50, enrichment=10, summarize=10. Code defaults: 5 for fetch/parse/enrichment, `os.cpu_count()` for summarize.
 
 This gives **independent scaling per stage** — a fetch backlog won't starve summarize workers, and each stage can be scaled to its own bottleneck:
 ```bash
 docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale enrichment-worker=2 --scale summarize-worker=2
 ```
 
-The DB connection pool is `pool_size=30` with `max_overflow=60` — up to **90 concurrent connections per worker pod** (see [PgBouncer section](#why-does-each-worker-consume-30-db-connections-what-is-pgbouncer) for the math at scale). The aiohttp connector allows `limit=100` total connections with `limit_per_host=2`.
+The DB connection pool is `pool_size=30` with `max_overflow=60` — up to **90 concurrent connections per worker pod** (see [PgBouncer section](#why-does-each-worker-consume-30-db-connections-what-is-pgbouncer) for the math at scale). The aiohttp connector allows `limit=100` total connections with `limit_per_host=10`.
 
 ---
 
@@ -100,15 +100,15 @@ Detect YouTube RSS URLs before making the HTTP request. YouTube channel URLs ret
 
 ## Wont Temporal retry for transient errors like 429?
 
-**Yes.** The current fix only suppresses Temporal retries for **permanent failures** (404/403/410). Transient errors like 429 rate limiting, connection timeouts, and DNS failures still propagate as exceptions, triggering Temporal's retry policy (`MAX_ACTIVITY_RETRIES` = 1 attempt, with exponential backoff).
+**Yes.** The current fix only suppresses Temporal retries for **permanent failures** (404/403/410). Transient errors like 429 rate limiting, connection timeouts, and DNS failures still propagate as exceptions. However, with `MAX_ACTIVITY_RETRIES=1` (i.e., `maximum_attempts=1`), Temporal does **not** retry — the activity fails immediately on the first attempt. The fetcher itself handles retries internally (3 attempts with backoff).
 
 The retry chain for transient errors:
 1. **Fetcher level** (aiohttp): 3 retries with 1s/2s backoff
-2. **Temporal level** (workflow): 1 retry with exponential backoff
+2. **Temporal level** (workflow): 0 retries (`maximum_attempts=1`)
 
-This gives up to **4 total attempts** for transient failures — enough to handle temporary network or server issues without wasting time on permanently dead URLs.
+This gives up to **3 total attempts** for transient failures at the fetcher level — enough to handle temporary network or server issues without wasting time on permanently dead URLs.
 
-**Timeout math:** `ACTIVITY_TIMEOUT_SECONDS` default is now **60s** (was 15s), and `MAX_ACTIVITY_RETRIES` is **1** (was 3). This means `CHILD_WORKFLOW_TIMEOUT` = 60 × 1 × 3 = **180s** (3 minutes) per child workflow, allowing sufficient time for enrichment of large feeds without premature timeout.
+**Timeout math:** `ACTIVITY_TIMEOUT_SECONDS` default is **60s**, `MAX_ACTIVITY_RETRIES` is **1** (1 attempt, no retries). Activity budget = 60 × 1 × 3 = 180s. Adding `ENRICHMENT_TIMEOUT_BUDGET = 300s` (max 20 articles × 15s) + 60s safety margin → `CHILD_WORKFLOW_TIMEOUT = 540s` (9 minutes). This ensures the parent `UrlWorkflow` never kills the enrichment child before it completes.
 
 ---
 
@@ -128,9 +128,9 @@ With each queue running in its own OS process, blocking CPU calls (`trafilatura.
 
 ## Why does each worker consume 30 DB connections? What is PgBouncer?
 
-**The math:** `src/infrastructure/db/session.py:16` sets `pool_size=10, max_overflow=20` = up to **30 concurrent DB connections per worker**. Each activity borrows a session from the pool; if all 30 are in use, subsequent activities queue up.
+**The math:** `src/infrastructure/db/session.py:16` sets `pool_size=30, max_overflow=60` = up to **90 concurrent DB connections per worker**. Each activity borrows a session from the pool; if all 90 are in use, subsequent activities queue up.
 
-**The problem at scale:** 101 workers × 30 connections = 3,030 concurrent DB connections. PostgreSQL out-of-the-box is configured for ~100-200 connections. Beyond that, each backend process (fork, auth, memory) becomes the bottleneck — performance degrades sharply.
+**The problem at scale:** 101 workers × 90 connections = 9,090 concurrent DB connections. PostgreSQL out-of-the-box is configured for ~100-200 connections. Beyond that, each backend process (fork, auth, memory) becomes the bottleneck — performance degrades sharply.
 
 **PgBouncer** is a lightweight connection pooler that sits between workers and PostgreSQL:
 
@@ -144,7 +144,7 @@ Worker 101 ┘
 
 - **Workers** open/close connections fast (cheap, no auth/backend fork per open)
 - **PgBouncer** reuses a small set of real DB connections across all workers
-- **Result:** Postgres sees only 50-100 connections instead of 3,030
+- **Result:** Postgres sees only 50-100 connections instead of 9,090
 - **Trade-off:** Transaction-pooling mode means sessions can't span multiple transactions — not an issue here since each `get_db_session()` is scoped to one activity
 
 **Alternatives:**
@@ -227,4 +227,5 @@ If you know certain URLs will always fail (e.g., specific deleted YouTube channe
 | DB connections per worker pod | 30 max | 90 max |
 | Articles processed per feed | 20 | 10 |
 | Worker queues | 4 | 6 (workflow, url-workflow, fetch, parse, enrichment, summarize) |
+| Job status derivation | Incremental DB update | Derived from task counts at query time (safety net) |
 | Thread pool | `asyncio.to_thread` used | None needed (per-process isolation) |

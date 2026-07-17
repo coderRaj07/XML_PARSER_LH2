@@ -381,5 +381,5 @@ Copy this into Swagger UI at `http://localhost:8000/docs`:
 | Document | Description |
 |----------|-------------|
 | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture diagrams, concurrency model, design decisions, scaling analysis, tradeoffs |
-| [`FIXES.md`](docs/FIXES.md) | Complete log of all 11 issues faced during development and how they were resolved |
+| [`FIXES.md`](docs/FIXES.md) | Complete log of all 19 issues faced during development and how they were resolved |
 | [`PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md) | Q&A on performance bottlenecks, retry behavior, scaling, and expected improvements |

@@ -39,7 +39,7 @@ MAX_CONCURRENT_URLS = int(os.getenv("MAX_CONCURRENT_URLS", "10"))
 ACTIVITY_TIMEOUT = timedelta(seconds=float(os.getenv("ACTIVITY_TIMEOUT_SECONDS", "60")))
 MAX_ACTIVITY_RETRIES = int(os.getenv("ACTIVITY_MAX_RETRIES", "1"))
 NUM_ACTIVITIES = 3
-ENRICHMENT_TIMEOUT_BUDGET = 300  # max 20 articles × 15s each (with batching)
+ENRICHMENT_TIMEOUT_BUDGET = 300  # budget for CHILD_WORKFLOW_TIMEOUT derivation (actual enrichment uses 30s/article, capped at 300s)
 _activity_budget = ACTIVITY_TIMEOUT.total_seconds() * MAX_ACTIVITY_RETRIES * NUM_ACTIVITIES
 _child_timeout_seconds = _activity_budget + ENRICHMENT_TIMEOUT_BUDGET + 60  # 60s safety margin
 CHILD_WORKFLOW_TIMEOUT = timedelta(seconds=float(os.getenv("CHILD_WORKFLOW_TIMEOUT_SECONDS", str(_child_timeout_seconds))))

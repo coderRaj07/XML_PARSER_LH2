@@ -95,7 +95,10 @@ Each child then schedules its own activities:
 Child Workflow URL1
     ├── Fetch Activity   ──► fetch-queue
     ├── Parse Activity   ──► parse-queue
-    └── Summary Activity ──► summary-queue
+    ├── EnrichmentWorkflow (child) ──► enrichment-queue
+    │       └── fetch_article activities (batched, 5 at a time)
+    ├── Summary Activity ──► summary-queue
+    └── FinalizeTaskActivity ──► url-workflow-queue (finally block)
 ```
 
 ### Do Child Workflows Get Their Own Workers?
@@ -130,24 +133,27 @@ Parent Workflow (JobWorkflow) ── workflow-queue ──► Workflow Worker
     │       ├── fetch-queue ──── Fetch Worker
     │       ├── parse-queue ──── Parse Worker
     │       ├── enrichment-queue ── Enrichment Worker (EnrichmentWorkflow)
-    │       │       └── fetch_article activity per record
-    │       └── summarize-queue ── Summary Worker
+    │       │       └── fetch_article activity per record (batched, 5 at a time)
+    │       ├── summarize-queue ── Summary Worker
+    │       └── finalize_task ── url-workflow-queue (in finally block, safety net)
     │
     ├── Child Workflow URL2 (UrlWorkflow) ── url-workflow-queue ──► URL Workflow Worker
     │       ├── fetch-queue ──── Fetch Worker
     │       ├── parse-queue ──── Parse Worker
     │       ├── enrichment-queue ── Enrichment Worker (EnrichmentWorkflow)
-    │       └── summarize-queue ── Summary Worker
+    │       ├── summarize-queue ── Summary Worker
+    │       └── finalize_task ── url-workflow-queue
     │
     └── Child Workflow URL3 (UrlWorkflow) ── url-workflow-queue ──► URL Workflow Worker
             ├── fetch-queue ──── Fetch Worker
             ├── parse-queue ──── Parse Worker
             ├── enrichment-queue ── Enrichment Worker (EnrichmentWorkflow)
-            └── summarize-queue ── Summary Worker
+            ├── summarize-queue ── Summary Worker
+            └── finalize_task ── url-workflow-queue
 
 Shared workers:
     workflow-worker     ── runs JobWorkflow (parent), polls workflow-queue
-    url-workflow-worker ── runs UrlWorkflow (children), polls url-workflow-queue
+    url-workflow-worker ── runs UrlWorkflow (children) + finalize_task activity, polls url-workflow-queue
     fetch-worker        ── polls fetch-queue for all fetch activities
     parse-worker        ── polls parse-queue for all parse activities
     enrichment-worker   ── polls enrichment-queue for fetch_article + EnrichmentWorkflow
@@ -169,48 +175,52 @@ Each child workflow spawn adds events to the **parent's** history. With 101 URLs
 The parent workflow uses `continue_as_new` after every batch to reset its history:
 
 ```
-Parent Workflow (batch 1 of 10 URLs)
-    │  spawn 10 child workflows
-    │  history: ~150 events, ~2MB
+Parent Workflow (batch 1 of 50 URLs)
+    │  spawn 50 child workflows
+    │  history: ~750 events, ~10MB
     │
-    ├── continue_as_new(job_id, remaining_91)
-    │
-    ▼
-Parent Workflow (batch 2 of 10 URLs)  ← fresh history
-    │  spawn 10 child workflows
-    │  history: ~150 events, ~2MB
-    │
-    ├── continue_as_new(job_id, remaining_81)
+    ├── continue_as_new(job_id, remaining_51)
     │
     ▼
-... (repeats until all URLs processed)
+Parent Workflow (batch 2 of 51 URLs)  ← fresh history
+    │  spawn 50 child workflows
+    │  history: ~750 events, ~10MB
+    │
+    ├── continue_as_new(job_id, remaining_1)
+    │
+    ▼
+Parent Workflow (batch 3 of 1 URL)  ← fresh history
+    │  spawn 1 child workflow, await completion
+    │
+    └── return final results
 ```
 
 **Key details:**
-- `BATCH_SIZE = 10` — each execution only tracks 10 child workflows
+- `BATCH_SIZE = 50` — each execution only tracks 50 child workflows
 - `continue_as_new()` replaces the current execution entirely — the new execution starts with zero history
 - Results are already persisted in the DB by each activity, so no accumulator needs to be passed between executions
 - The last execution returns the final result (only its batch — the API reads full status from the DB)
 
-### Article-Level: Per-Domain Concurrency (EnrichmentWorkflow)
+### Article-Level: Batched Enrichment (EnrichmentWorkflow)
 
-Article content fetching is handled by the **EnrichmentWorkflow** — a child workflow spawned by UrlWorkflow after parsing completes. It runs on the `enrichment-queue` and schedules `fetch_article` activities concurrently:
+Article content fetching is handled by the **EnrichmentWorkflow** — a child workflow spawned by `UrlWorkflow` after parsing completes. It runs on the `enrichment-queue` and schedules `fetch_article` activities in batches of 5:
 
 ```
 UrlWorkflow
   └── Start EnrichmentWorkflow (child, on enrichment-queue)
         │
-        ├── fetch_article(record1) ──► enrichment-queue ──► Enrichment Worker
-        ├── fetch_article(record2) ──► enrichment-queue ──► Enrichment Worker
-        ├── fetch_article(record3) ──► enrichment-queue ──► Enrichment Worker
-        └── (all via asyncio.gather)
+        ├── Batch 1: fetch_article(record1-5) ──► enrichment-queue
+        │     └── asyncio.gather (5 concurrent)
+        │
+        ├── Batch 2: fetch_article(record6-10) ──► enrichment-queue
+        │     └── asyncio.gather (5 concurrent)
+        │
+        └── ... (ENRICHMENT_BATCH_SIZE=5 per batch)
               │
-              └── Per-record: fetch + trafilatura extract + store in DB
+              └── Per-record: fetch + trafilatura extract + gzip + store in S3
 ```
 
-- **Different domains**: fully concurrent (no throttling between them)
-- **Same domain**: up to 2 concurrent with 1s gap between start times (per-domain semaphore)
-- **Config**: `CONCURRENT_PER_DOMAIN = 2`, throttle = 1.0s
+- **Batching**: Activities are launched in groups of `ENRICHMENT_BATCH_SIZE=5`. Each batch completes before the next starts, preventing Temporal `Workflow is busy` errors from too many concurrent completions.
 - **Scaling**: EnrichmentWorker processes can be scaled independently (`docker compose --scale enrichment-worker=N`)
 
 ### Activity-Level: Per-Activity DB Sessions (FastAPI-style)
@@ -234,18 +244,34 @@ EnrichmentActivity (polled from enrichment-queue by enrichment-worker)
   └── per record: fetch_article activity
         fetcher.fetch(source_link) → article_html
         trafilatura.extract(article_html) → full_content
-        record_repo.update_full_content(record_id, full_content)
+        gzip + store in MinIO/S3
+        record_repo.update_full_content(record_id, full_content, s3_key)
         session.commit()
 
 SummarizeActivity (polled from summarize-queue by summarize-worker)
-  └── async with session_factory() as session:
+  └── Session 1: Summarize + commit task status
         record_repo.list_by_task(task_id) → records
         for each record: generate_summary → save_summary
         task.mark_completed() → task_repo.update()
-        job.update_progress() → job_repo.update()
-        session.commit()
+        session.commit()                          ← task persisted
+  └── Session 2: Update job status (separate transaction)
+        count_by_status(job_id) → (pending, completed, failed)
+        job.update_progress(completed, failed)
+        job_repo.update() → session.commit()
 
-Each activity gets a fresh AsyncSession from the pool, managed via
+Two sessions prevent a SQL COUNT race condition: Session 1 commits
+the task status before Session 2 counts tasks. Without this, concurrent
+summarize activities miss each other's uncommitted flushes, and the
+count never reaches total_tasks.
+
+FinalizeTaskActivity (polled from url-workflow-queue by url-workflow-worker)
+  └── Safety net: runs in UrlWorkflow's finally block
+        If task is still "pending" and has records with summaries → mark completed
+        If task is still "pending" and has no summaries → mark failed
+        Updates job progress via separate session
+        Handles edge cases where workflow terminates before normal completion
+
+Each activity gets fresh AsyncSessions from the pool, managed via
 `async with session_factory() as session:` — auto-closes on exit,
 auto-rollbacks on exception (FastAPI-style lifecycle).
 ```
@@ -289,17 +315,20 @@ Each UrlWorkflow (on url-workflow-queue) schedules activities:
   │    ├──► Start EnrichmentWorkflow (child) ──► enrichment-queue
   │    │         │
   │    │         └── Enrichment Worker (polls enrichment-queue)
-  │    │                ├── Schedules fetch_article per record (asyncio.gather)
-  │    │                ├── Each fetch_article: fetch + trafilatura + store full_content
+  │    │                ├── Schedules fetch_article per record in batches of 5
+  │    │                ├── Each fetch_article: fetch + trafilatura + gzip + store in S3
   │    │                └── Returns {"enriched": N, "failed": M}
   │    │
-  │    └──► Schedule summarize_records ──► summarize-queue
-  │              │
-  │              └── Summary Worker (polls queue)
-  │                     ├── list records by task_id from DB
-  │                     ├── generate summaries (TextRank + TF-IDF + LSA)
-  │                     ├── mark task completed
-  │                     └── update job progress → session.commit()
+  │    ├──► Schedule summarize_records ──► summarize-queue
+  │    │         │
+  │    │         └── Summary Worker (polls queue)
+  │    │                ├── list records by task_id from DB
+  │    │                ├── generate summaries (TextRank + TF-IDF + LSA)
+  │    │                ├── mark task completed (session 1)
+  │    │                └── update job progress (session 2) → session.commit()
+  │    │
+  │    └──► (finally) Schedule finalize_task ──► url-workflow-queue
+  │              └── Safety net: if task still pending, finalize based on records/summaries
 ```
 
 ## Data Flow (Fixed — 4-Stage Pipeline)
@@ -317,7 +346,7 @@ Start Temporal Workflow — JobWorkflow (parent, on workflow-worker)
 Parent spawns UrlWorkflow children per URL (batched via continue_as_new)
   │
   ▼
-Each UrlWorkflow (on url-workflow-queue) runs the 4-stage pipeline:
+Each UrlWorkflow (on url-workflow-queue) runs the 4-stage pipeline + finalize:
   │
   │  UrlWorkflow[task_id]:
   │    │
@@ -328,10 +357,13 @@ Each UrlWorkflow (on url-workflow-queue) runs the 4-stage pipeline:
   │    │         └── Parse Worker → read from S3 → feedparser → store records in DB
   │    │
   │    ├──► Stage 3: EnrichmentWorkflow (child) ──► enrichment-queue
-  │    │         └── Enrichment Worker → fetch_article per record concurrently
+  │    │         └── Enrichment Worker → fetch_article per record (batched, 5 at a time)
   │    │
-  │    └──► Stage 4: summarize_records ──► summarize-queue
-  │              └── Summary Worker → generate summaries → mark task completed
+  │    ├──► Stage 4: summarize_records ──► summarize-queue
+  │    │         └── Summary Worker → generate summaries → mark task completed
+  │    │
+  │    └──► (finally) finalize_task ──► url-workflow-queue
+  │              └── Safety net: finalize task if still pending
 ```
 
 ## Payload Size Anti-Pattern: Raw XML Through Temporal
@@ -486,7 +518,7 @@ Check which activity result or argument is oversized by looking at the size valu
 
 ```
 Session: aiohttp.ClientSession
-  ├── Connector: TCPConnector(limit=100, limit_per_host=2)
+  ├── Connector: TCPConnector(limit=100, limit_per_host=10)
   ├── Timeout: ClientTimeout(total=30s)
   ├── Headers: Chrome 134 browser headers
   │     ├── User-Agent: Mozilla/5.0 ... Chrome/134 ...
@@ -509,9 +541,9 @@ Session: aiohttp.ClientSession
 | 2 | 2s | Last attempt, then raises `RuntimeError` |
 
 **Temporal activity retry policy** (in `workflows.py:25-30`):
-- `maximum_attempts=3` — only triggers if the activity raises an exception
+- `maximum_attempts=1` — each activity gets only 1 attempt (no Temporal-level retries)
 - Permanent failures are persisted as task failures and returned (no exception) — Temporal does not retry
-- Only transient errors (network timeouts, rate limits, DB errors) propagate and trigger Temporal retries
+- Only transient errors (network timeouts, rate limits, DB errors) that propagate as exceptions would trigger retries, but with `maximum_attempts=1` they fail immediately
 
 **Special status codes:**
 - **403/404/410 (Permanent)**: Raise `RuntimeError` immediately — no retry within activity. Task is persisted as failed and temporal does not retry the activity
