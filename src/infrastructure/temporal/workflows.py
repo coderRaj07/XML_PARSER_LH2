@@ -101,7 +101,20 @@ class UrlWorkflow:
     @workflow.run
     async def run(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
         logger.info("url_workflow_started", extra={"task_id": task_id, "url": url})
+        try:
+            return await self._run_inner(task_id, url, job_id)
+        finally:
+            try:
+                await workflow.execute_activity(
+                    "finalize_task",
+                    args=[task_id, job_id],
+                    task_queue=URL_WORKFLOW_QUEUE,
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+            except Exception:
+                logger.exception("url_workflow_finalize_failed", extra={"task_id": task_id})
 
+    async def _run_inner(self, task_id: str, url: str, job_id: str) -> dict[str, Any]:
         try:
             logger.info("url_workflow_fetch_start", extra={"task_id": task_id})
             fetch_result = await workflow.execute_activity(

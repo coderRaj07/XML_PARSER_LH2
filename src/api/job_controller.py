@@ -53,13 +53,24 @@ async def list_tasks(job_id: str) -> list[dict]:
     from src.main import get_job_service as factory
     async with factory() as (service, repo, task_repo):
         tasks = await service.list_tasks(job_id)
-        return [
-            {
+        result = []
+        for t in tasks:
+            status = t.status.value if hasattr(t.status, "value") else t.status
+            if status == "pending":
+                from src.infrastructure.db import DatabaseSessionManager
+                from src.infrastructure.repositories import PostgresRecordRepository
+                async with DatabaseSessionManager.get_session_factory()() as check_session:
+                    rec_repo = PostgresRecordRepository(check_session)
+                    records = await rec_repo.list_by_task(t.id)
+                    if records and any(r.summary_text for r in records):
+                        status = "completed"
+                    elif records:
+                        status = "failed"
+            result.append({
                 "id": t.id,
                 "url": t.url,
-                "status": t.status,
+                "status": status,
                 "attempts": t.attempts,
                 "error": t.error,
-            }
-            for t in tasks
-        ]
+            })
+        return result

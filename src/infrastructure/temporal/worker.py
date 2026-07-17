@@ -9,7 +9,7 @@ from src.application.interfaces.fetcher import Fetcher
 from src.application.services.summary_service import SummaryService
 from src.application.strategies.parser.base_parser_strategy import ParserStrategy
 from src.infrastructure.storage import S3Storage
-from src.infrastructure.temporal.activities import EnrichmentActivity, FetchActivity, ParseActivity, SummarizeActivity
+from src.infrastructure.temporal.activities import EnrichmentActivity, FetchActivity, FinalizeTaskActivity, ParseActivity, SummarizeActivity
 from src.infrastructure.temporal.config import (
     ENRICHMENT_WORKER_COUNT,
     FETCH_WORKER_COUNT,
@@ -55,10 +55,12 @@ async def run_queue_worker(
         await worker_task
 
     elif queue == "url-workflow":
+        finalize_activity = FinalizeTaskActivity(session_factory=session_factory)
         w = Worker(
             client=client,
             task_queue=URL_WORKFLOW_QUEUE,
             workflows=[UrlWorkflow],
+            activities=[finalize_activity.finalize_task],
         )
         worker_task = asyncio.create_task(w.run())
         logger.info("URL workflow worker started", extra={"task_queue": URL_WORKFLOW_QUEUE})

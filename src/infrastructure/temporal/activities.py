@@ -295,3 +295,51 @@ class SummarizeActivity:
                     "status": "failed",
                     "error": str(e),
                 }
+
+
+class FinalizeTaskActivity:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    @activity.defn
+    async def finalize_task(self, task_id: str, job_id: str) -> dict:
+        async with self._session_factory() as session:
+            task_repo = PostgresTaskRepository(session)
+            record_repo = PostgresRecordRepository(session)
+            job_repo = PostgresJobRepository(session)
+
+            task = await task_repo.get(task_id)
+            if task is None:
+                return {"task_id": task_id, "status": "not_found"}
+
+            if task.status.value != "pending":
+                return {"task_id": task_id, "status": task.status.value, "skipped": True}
+
+            records = await record_repo.list_by_task(task_id)
+            has_records = len(records) > 0
+            has_summaries = any(r.summary_text for r in records)
+
+            if has_records and has_summaries:
+                task.mark_completed()
+                logger.info("finalize_completed_via_summaries", extra={"task_id": task_id})
+            else:
+                task.mark_failed("Workflow terminated before task was finalized")
+                logger.warning("finalize_failed_no_summaries", extra={"task_id": task_id, "has_records": has_records})
+
+            await task_repo.update(task)
+            await session.commit()
+
+            try:
+                async with self._session_factory() as job_session:
+                    job_repo2 = PostgresJobRepository(job_session)
+                    task_repo2 = PostgresTaskRepository(job_session)
+                    job = await job_repo2.get(job_id)
+                    if job:
+                        pending, completed, failed = await task_repo2.count_by_status(job_id)
+                        job.update_progress(completed, failed)
+                        await job_repo2.update(job)
+                        await job_session.commit()
+            except Exception:
+                logger.exception("finalize_job_update_failed", extra={"task_id": task_id})
+
+            return {"task_id": task_id, "status": task.status.value}
