@@ -36,8 +36,12 @@ async def get_job(job_id: str) -> JobStatusResponse:
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found")
         pending, completed, failed = await task_repo.count_by_status(job_id)
+        if pending == 0 and completed + failed >= job.total_tasks:
+            actual_status = "completed"
+        else:
+            actual_status = job.status.value
         return JobStatusResponse(
-            status=job.status.value,
+            status=actual_status,
             total=job.total_tasks,
             completed=completed,
             failed=failed,

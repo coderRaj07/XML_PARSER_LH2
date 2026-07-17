@@ -251,14 +251,18 @@ class SummarizeActivity:
 
                 task.mark_completed()
                 await task_repo.update(task)
-
-                job = await job_repo.get(job_id)
-                if job:
-                    pending, completed, failed = await task_repo.count_by_status(job_id)
-                    job.update_progress(completed, failed)
-                    await job_repo.update(job)
-
                 await session.commit()
+
+                async with self._session_factory() as job_session:
+                    job_repo = PostgresJobRepository(job_session)
+                    task_repo2 = PostgresTaskRepository(job_session)
+                    job = await job_repo.get(job_id)
+                    if job:
+                        pending, completed, failed = await task_repo2.count_by_status(job_id)
+                        job.update_progress(completed, failed)
+                        await job_repo.update(job)
+                        await job_session.commit()
+
                 logger.info("summarize_completed", extra={"task_id": task_id})
                 return {
                     "task_id": task.id,
@@ -272,6 +276,20 @@ class SummarizeActivity:
                 task.mark_failed(str(e))
                 await task_repo.update(task)
                 await session.commit()
+
+                try:
+                    async with self._session_factory() as job_session:
+                        job_repo = PostgresJobRepository(job_session)
+                        task_repo2 = PostgresTaskRepository(job_session)
+                        job = await job_repo.get(job_id)
+                        if job:
+                            pending, completed, failed = await task_repo2.count_by_status(job_id)
+                            job.update_progress(completed, failed)
+                            await job_repo.update(job)
+                            await job_session.commit()
+                except Exception:
+                    logger.exception("summarize_job_update_after_failure", extra={"task_id": task_id})
+
                 return {
                     "task_id": task.id,
                     "status": "failed",
