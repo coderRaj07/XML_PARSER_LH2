@@ -25,6 +25,15 @@ class PostgresRecordRepository(RecordRepository):
         await self._session.flush()
         return records
 
+    async def update_content(self, record_id: str, content: str, s3_key: str) -> None:
+        stmt = select(RecordModel).where(RecordModel.id == record_id)
+        result = await self._session.execute(stmt)
+        model = result.scalar_one_or_none()
+        if model is not None:
+            model.content = content
+            model.full_content_s3_key = s3_key
+            await self._session.flush()
+
     async def list_by_task(self, task_id: str) -> list[Record]:
         stmt = (
             select(RecordModel)

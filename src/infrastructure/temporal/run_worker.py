@@ -28,7 +28,6 @@ QUEUE = os.getenv("QUEUE", "workflow")
 
 async def main() -> None:
     DatabaseSessionManager.initialize(DATABASE_URL)
-    await DatabaseSessionManager.create_tables()
     session_factory = DatabaseSessionManager.get_session_factory()
 
     fetcher: Fetcher = AioHttpFetcher()

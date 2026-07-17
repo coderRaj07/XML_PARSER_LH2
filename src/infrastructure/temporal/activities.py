@@ -2,9 +2,7 @@ import asyncio
 import gzip
 import io
 import logging
-from asyncio import CancelledError
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
 
 import trafilatura
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -80,13 +78,11 @@ class ParseActivity:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         parser: ParserStrategy,
-        fetcher: Fetcher,
         storage: S3Storage,
         max_articles: int = 10,
     ) -> None:
         self._session_factory = session_factory
         self._parser = parser
-        self._fetcher = fetcher
         self._storage = storage
         self._max_articles = max_articles
 
@@ -112,68 +108,84 @@ class ParseActivity:
                 if len(records) > self._max_articles:
                     records = records[: self._max_articles]
 
-                await self._fetch_full_contents(records, job_id, task_id)
                 if records:
                     await record_repo.create_many(records)
-                await session.commit()
+                    await session.commit()
+
+                record_infos = [
+                    {"id": r.id, "source_link": r.source_link}
+                    for r in records
+                    if r.source_link
+                ]
 
                 logger.info(
                     "parse_completed",
                     extra={"task_id": task_id, "original_count": original_count, "saved": len(records)},
                 )
-                return {"task_id": task_id, "record_count": len(records)}
-            except Exception as e:
+                return {
+                    "task_id": task_id,
+                    "record_count": len(records),
+                    "record_infos": record_infos,
+                }
+            except BaseException as e:
+                if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                    raise
                 task.mark_failed(str(e))
                 await task_repo.update(task)
                 await session.commit()
                 logger.error("parse_failed", extra={"task_id": task_id, "error": str(e)})
                 return {"task_id": task_id, "status": "failed", "error": str(e)}
 
-    async def _fetch_full_contents(self, records: list[Record], job_id: str, task_id: str) -> None:
-        semaphores: dict[str, asyncio.Semaphore] = {}
-        CONCURRENT_PER_DOMAIN = 10
 
-        async def _fetch_one(record: Record) -> None:
-            if not record.source_link:
-                return
-            domain = urlparse(record.source_link).netloc
-            if domain not in semaphores:
-                semaphores[domain] = asyncio.Semaphore(CONCURRENT_PER_DOMAIN)
-            async with semaphores[domain]:
-                html: str | None = None
-                try:
-                    html = await self._fetcher.fetch(record.source_link)
-                    loop = asyncio.get_running_loop()
-                    extracted = await loop.run_in_executor(None, trafilatura.extract, html)
-                    if extracted and not _is_garbage(extracted):
-                        compressed = gzip.compress(extracted.encode("utf-8"))
-                        content_key = self._storage._make_content_key(job_id, task_id, record.id)
-                        await self._storage.store_stream(
-                            content_key, io.BytesIO(compressed), "application/gzip"
-                        )
-                        record.full_content_s3_key = content_key
-                        record.content = extracted
-                        del compressed
-                    elif extracted:
-                        logger.info(
-                            "extracted_content_garbage_skipped",
-                            extra={"record_id": record.id, "url": record.source_link, "text": extracted[:80]},
-                        )
-                except Exception:
-                    logger.warning(
-                        "full_content_fetch_failed",
-                        extra={"record_id": record.id, "url": record.source_link},
+class EnrichmentActivity:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fetcher: Fetcher,
+        storage: S3Storage,
+    ) -> None:
+        self._session_factory = session_factory
+        self._fetcher = fetcher
+        self._storage = storage
+
+    @activity.defn
+    async def fetch_article(self, record_id: str, source_link: str, job_id: str, task_id: str) -> dict:
+        logger.info("enrichment_started", extra={"record_id": record_id, "url": source_link})
+        try:
+            html: str | None = None
+            try:
+                html = await self._fetcher.fetch(source_link)
+                loop = asyncio.get_running_loop()
+                extracted = await loop.run_in_executor(None, trafilatura.extract, html)
+                if extracted and not _is_garbage(extracted):
+                    compressed = gzip.compress(extracted.encode("utf-8"))
+                    content_key = self._storage._make_content_key(job_id, task_id, record_id)
+                    await self._storage.store_stream(
+                        content_key, io.BytesIO(compressed), "application/gzip"
                     )
-                finally:
-                    del html
-
-        coros = [_fetch_one(r) for r in records if r.source_link]
-        if not coros:
-            return
-        results = await asyncio.gather(*coros, return_exceptions=True)
-        for r in results:
-            if isinstance(r, CancelledError):
-                raise r
+                    async with self._session_factory() as session:
+                        record_repo = PostgresRecordRepository(session)
+                        await record_repo.update_content(record_id, extracted, content_key)
+                        await session.commit()
+                    logger.info("enrichment_completed", extra={"record_id": record_id})
+                    return {"record_id": record_id, "status": "completed"}
+                else:
+                    logger.info(
+                        "enrichment_skipped_garbage",
+                        extra={"record_id": record_id, "url": source_link},
+                    )
+                    return {"record_id": record_id, "status": "skipped"}
+            except Exception as e:
+                logger.warning(
+                    "enrichment_failed",
+                    extra={"record_id": record_id, "url": source_link, "error": str(e)},
+                )
+                return {"record_id": record_id, "status": "failed", "error": str(e)}
+            finally:
+                del html
+        except Exception as e:
+            logger.error("enrichment_unexpected_error", extra={"record_id": record_id, "error": str(e)})
+            return {"record_id": record_id, "status": "failed", "error": str(e)}
 
 
 class SummarizeActivity:
@@ -220,7 +232,19 @@ class SummarizeActivity:
                         model_used="textrank+tfidf+lsa",
                     )
 
-                summaries = await asyncio.gather(*[_summarize_one(r) for r in records])
+                sem = asyncio.Semaphore(self._max_summary_workers)
+
+                async def _throttled_summarize(record: Record) -> Summary:
+                    async with sem:
+                        return await _summarize_one(record)
+
+                results = await asyncio.gather(*[_throttled_summarize(r) for r in records], return_exceptions=True)
+                summaries = [r for r in results if isinstance(r, Summary)]
+                errors = [r for r in results if isinstance(r, Exception)]
+                if errors:
+                    logger.warning("summarize_partial_failures", extra={"task_id": task_id, "total": len(records), "failed": len(errors), "succeeded": len(summaries)})
+                if not summaries:
+                    raise RuntimeError(f"All {len(records)} summaries failed. First error: {errors[0] if errors else 'unknown'}")
                 await record_repo.save_summaries_many(summaries)
                 for summary in summaries:
                     logger.info("summary_completed", extra={"record_id": summary.record_id})
@@ -241,7 +265,9 @@ class SummarizeActivity:
                     "status": task.status.value,
                     "error": task.error,
                 }
-            except Exception as e:
+            except BaseException as e:
+                if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                    raise
                 logger.error("summarize_failed", extra={"task_id": task_id, "error": str(e)})
                 task.mark_failed(str(e))
                 await task_repo.update(task)

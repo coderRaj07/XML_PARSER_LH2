@@ -4,9 +4,6 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.infrastructure.db.models import Base
-
-
 class DatabaseSessionManager:
     _engine: Optional[async_sessionmaker[AsyncSession]] = None
     _database_url: str = ""
@@ -22,15 +19,6 @@ class DatabaseSessionManager:
         if cls._engine is None:
             raise RuntimeError("DatabaseSessionManager is not initialized")
         return cls._engine
-
-    @classmethod
-    async def create_tables(cls) -> None:
-        if not cls._database_url:
-            return
-        engine = create_async_engine(cls._database_url)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        await engine.dispose()
 
     @classmethod
     async def dispose(cls) -> None:
@@ -55,5 +43,4 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
-create_tables = DatabaseSessionManager.create_tables
 dispose_engine = DatabaseSessionManager.dispose

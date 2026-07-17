@@ -69,6 +69,15 @@ services:
     depends_on:
       - temporal
 
+  init-db:
+    build: .
+    command: python -m alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   app:
     build: .
     ports:
@@ -81,9 +90,16 @@ services:
       S3_BUCKET: xml-feeds
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
-      postgres:
-        condition: service_healthy
+      init-db:
+        condition: service_completed_successfully
       temporal:
         condition: service_healthy
       minio:
@@ -105,8 +121,28 @@ services:
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
     depends_on:
-      postgres:
+      init-db:
+        condition: service_completed_successfully
+      temporal:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  url-workflow-worker:
+    build: .
+    command: python -m src.infrastructure.temporal.run_worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
+      TEMPORAL_HOST: temporal:7233
+      LOG_LEVEL: INFO
+      QUEUE: url-workflow
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: xml-feeds
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
       temporal:
         condition: service_healthy
       minio:
@@ -126,8 +162,8 @@ services:
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
     depends_on:
-      postgres:
-        condition: service_healthy
+      init-db:
+        condition: service_completed_successfully
       temporal:
         condition: service_healthy
       minio:
@@ -147,8 +183,29 @@ services:
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
     depends_on:
-      postgres:
+      init-db:
+        condition: service_completed_successfully
+      temporal:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  enrichment-worker:
+    build: .
+    command: python -m src.infrastructure.temporal.run_worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/xml_feeds
+      TEMPORAL_HOST: temporal:7233
+      LOG_LEVEL: INFO
+      QUEUE: enrichment
+      ENRICHMENT_WORKERS: "${ENRICHMENT_WORKERS:-10}"
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: xml-feeds
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
       temporal:
         condition: service_healthy
       minio:
@@ -162,14 +219,14 @@ services:
       TEMPORAL_HOST: temporal:7233
       LOG_LEVEL: INFO
       QUEUE: summarize
-      SUMMARIZE_WORKERS: "${SUMMARIZE_WORKERS:-4}"
+      SUMMARIZE_WORKERS: "${SUMMARIZE_WORKERS:-10}"
       S3_ENDPOINT_URL: http://minio:9000
       S3_BUCKET: xml-feeds
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
     depends_on:
-      postgres:
-        condition: service_healthy
+      init-db:
+        condition: service_completed_successfully
       temporal:
         condition: service_healthy
       minio:

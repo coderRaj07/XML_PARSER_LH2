@@ -9,19 +9,23 @@ from src.application.interfaces.fetcher import Fetcher
 from src.application.services.summary_service import SummaryService
 from src.application.strategies.parser.base_parser_strategy import ParserStrategy
 from src.infrastructure.storage import S3Storage
-from src.infrastructure.temporal.activities import FetchActivity, ParseActivity, SummarizeActivity
+from src.infrastructure.temporal.activities import EnrichmentActivity, FetchActivity, ParseActivity, SummarizeActivity
 from src.infrastructure.temporal.config import (
+    ENRICHMENT_WORKER_COUNT,
     FETCH_WORKER_COUNT,
     PARSE_WORKER_COUNT,
     SUMMARIZE_WORKER_COUNT,
 )
 from src.infrastructure.temporal.config import (
+    ENRICHMENT_QUEUE,
     FETCH_QUEUE,
     PARSE_QUEUE,
     SUMMARIZE_QUEUE,
+    URL_WORKFLOW_QUEUE,
     WORKFLOW_QUEUE,
 )
 from src.infrastructure.temporal.workflows import (
+    EnrichmentWorkflow,
     JobWorkflow,
     UrlWorkflow,
 )
@@ -44,10 +48,33 @@ async def run_queue_worker(
         w = Worker(
             client=client,
             task_queue=WORKFLOW_QUEUE,
-            workflows=[JobWorkflow, UrlWorkflow],
+            workflows=[JobWorkflow],
         )
         worker_task = asyncio.create_task(w.run())
         logger.info("Workflow worker started", extra={"task_queue": WORKFLOW_QUEUE})
+        await worker_task
+
+    elif queue == "url-workflow":
+        w = Worker(
+            client=client,
+            task_queue=URL_WORKFLOW_QUEUE,
+            workflows=[UrlWorkflow],
+        )
+        worker_task = asyncio.create_task(w.run())
+        logger.info("URL workflow worker started", extra={"task_queue": URL_WORKFLOW_QUEUE})
+        await worker_task
+
+    elif queue == "enrichment":
+        activity = EnrichmentActivity(session_factory=session_factory, fetcher=fetcher, storage=storage)
+        w = Worker(
+            client=client,
+            task_queue=ENRICHMENT_QUEUE,
+            activities=[activity.fetch_article],
+            workflows=[EnrichmentWorkflow],
+            max_concurrent_activities=ENRICHMENT_WORKER_COUNT,
+        )
+        worker_task = asyncio.create_task(w.run())
+        logger.info("Enrichment worker started", extra={"task_queue": ENRICHMENT_QUEUE, "max_concurrent": ENRICHMENT_WORKER_COUNT})
         await worker_task
 
     elif queue == "fetch":
@@ -63,7 +90,7 @@ async def run_queue_worker(
         await worker_task
 
     elif queue == "parse":
-        activity = ParseActivity(session_factory=session_factory, parser=parser, fetcher=fetcher, storage=storage)
+        activity = ParseActivity(session_factory=session_factory, parser=parser, storage=storage)
         w = Worker(
             client=client,
             task_queue=PARSE_QUEUE,
@@ -87,4 +114,4 @@ async def run_queue_worker(
         await worker_task
 
     else:
-        raise ValueError(f"Unknown queue: {queue}. Must be one of: workflow, fetch, parse, summarize")
+        raise ValueError(f"Unknown queue: {queue}. Must be one of: workflow, url-workflow, fetch, parse, enrichment, summarize")

@@ -114,7 +114,6 @@ async def get_job_service() -> AsyncGenerator[tuple[JobService, JobRepository, T
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     build_container()
-    await DatabaseSessionManager.create_tables()
     yield
     await DatabaseSessionManager.dispose()
 

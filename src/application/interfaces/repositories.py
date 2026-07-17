@@ -83,6 +83,10 @@ class RecordRepository(ABC):
         ...
 
     @abstractmethod
+    async def update_content(self, record_id: str, content: str, s3_key: str) -> None:
+        ...
+
+    @abstractmethod
     async def list_by_task(self, task_id: str) -> list[Record]:
         ...
 

@@ -9,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml ./
 RUN mkdir -p src && pip install --no-cache-dir -e ".[dev]"
 
-COPY alembic.ini alembic/ ./alembic/
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
 COPY src/ ./src/
 
 EXPOSE 8000
