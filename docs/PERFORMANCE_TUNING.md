@@ -2,20 +2,22 @@
 
 ## How many workers are we using?
 
-**4 processes, each with `max_concurrent_activities=5`.** Each queue runs in its own Docker container with its own OS process and event loop:
+**6 queues, each with `max_concurrent_activities=5`.** Each queue runs in its own Docker container with its own OS process and event loop:
 
 | Queue | Process | Role |
 |-------|---------|------|
-| `xml-feed-workflow-queue` | 1 `workflow-worker` container | Orchestrates the 3-stage pipeline (deterministic) |
+| `xml-feed-workflow-queue` | 1 `workflow-worker` container | Orchestrates batches, spawns UrlWorkflow children |
+| `xml-feed-url-workflow-queue` | 1 `url-workflow-worker` container | Runs UrlWorkflow (fetch→parse→enrich→summarize pipeline) |
 | `xml-feed-fetch-queue` | N `fetch-worker` containers | Fetches RSS/XML URLs (I/O-bound) |
-| `xml-feed-parse-queue` | N `parse-worker` containers | Parses XML, fetches article content, stores records (I/O + CPU) |
+| `xml-feed-parse-queue` | N `parse-worker` containers | Parses XML, saves record metadata (fast, ~2-3s) |
+| `xml-feed-enrichment-queue` | N `enrichment-worker` containers | Per-article full content fetch + trafilatura + S3 upload; also runs EnrichmentWorkflow |
 | `xml-feed-summarize-queue` | N `summarize-worker` containers | Generates summaries, updates task/job status (CPU-bound) |
 
-Each worker runs `max_concurrent_activities=5` (configurable via `FETCH_WORKERS`, `PARSE_WORKERS`, `SUMMARIZE_WORKERS` env vars).
+Each worker runs `max_concurrent_activities=5` (configurable via `FETCH_WORKERS`, `PARSE_WORKERS`, `ENRICHMENT_WORKERS`, `SUMMARIZE_WORKERS` env vars).
 
 This gives **independent scaling per stage** — a fetch backlog won't starve summarize workers, and each stage can be scaled to its own bottleneck:
 ```bash
-docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale enrichment-worker=2 --scale summarize-worker=2
 ```
 
 The DB connection pool is `pool_size=30` with `max_overflow=60` — up to **90 concurrent connections per worker pod** (see [PgBouncer section](#why-does-each-worker-consume-30-db-connections-what-is-pgbouncer) for the math at scale). The aiohttp connector allows `limit=100` total connections with `limit_per_host=2`.
@@ -78,11 +80,11 @@ With a single worker processing up to 200 concurrent activities (Temporal defaul
 Instead of 1 process per queue, run multiple containers per queue. Each container is a separate OS process with its own event loop — true CPU parallelism without thread pools.
 
 ```bash
-# Scale fetch to 3, parse to 2, summarize to 2
-docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
+# Scale fetch to 3, parse to 2, enrichment to 2, summarize to 2
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale enrichment-worker=2 --scale summarize-worker=2
 ```
 
-**Impact:** Near-linear speedup for I/O-bound work. 3 fetch + 2 parse + 2 summarize = ~2-3 min total.
+**Impact:** Near-linear speedup for I/O-bound work. 3 fetch + 2 parse + 2 enrichment + 2 summarize = ~2-3 min total.
 
 ---
 
@@ -98,13 +100,15 @@ Detect YouTube RSS URLs before making the HTTP request. YouTube channel URLs ret
 
 ## Wont Temporal retry for transient errors like 429?
 
-**Yes.** The current fix only suppresses Temporal retries for **permanent failures** (404/403/410). Transient errors like 429 rate limiting, connection timeouts, and DNS failures still propagate as exceptions, triggering Temporal's retry policy (3 attempts, 1s/2s/4s exponential backoff).
+**Yes.** The current fix only suppresses Temporal retries for **permanent failures** (404/403/410). Transient errors like 429 rate limiting, connection timeouts, and DNS failures still propagate as exceptions, triggering Temporal's retry policy (`MAX_ACTIVITY_RETRIES` = 1 attempt, with exponential backoff).
 
 The retry chain for transient errors:
 1. **Fetcher level** (aiohttp): 3 retries with 1s/2s backoff
-2. **Temporal level** (workflow): 3 retries with 1s/2s/4s backoff
+2. **Temporal level** (workflow): 1 retry with exponential backoff
 
-This gives up to **9 total attempts** for transient failures, with increasing backoff — enough to handle temporary network or server issues without wasting time on permanently dead URLs.
+This gives up to **4 total attempts** for transient failures — enough to handle temporary network or server issues without wasting time on permanently dead URLs.
+
+**Timeout math:** `ACTIVITY_TIMEOUT_SECONDS` default is now **60s** (was 15s), and `MAX_ACTIVITY_RETRIES` is **1** (was 3). This means `CHILD_WORKFLOW_TIMEOUT` = 60 × 1 × 3 = **180s** (3 minutes) per child workflow, allowing sufficient time for enrichment of large feeds without premature timeout.
 
 ---
 
@@ -222,4 +226,5 @@ If you know certain URLs will always fail (e.g., specific deleted YouTube channe
 | YouTube URL failure time | ~3-5s each | ~1-2s each |
 | DB connections per worker pod | 30 max | 90 max |
 | Articles processed per feed | 20 | 10 |
+| Worker queues | 4 | 6 (workflow, url-workflow, fetch, parse, enrichment, summarize) |
 | Thread pool | `asyncio.to_thread` used | None needed (per-process isolation) |

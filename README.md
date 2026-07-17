@@ -16,7 +16,7 @@ Production-grade backend for ingesting RSS/XML feeds, extracting records, and ge
 docker compose up --build -d
 
 # Follow worker logs to monitor processing
-docker compose logs -f workflow-worker fetch-worker parse-worker summarize-worker
+docker compose logs -f workflow-worker url-workflow-worker fetch-worker parse-worker enrichment-worker summarize-worker
 
 # API available at 
 http://localhost:8000
@@ -40,14 +40,14 @@ curl "http://localhost:8000/jobs/{job_id}/records?limit=5"
 ##### Run with multiple workers (faster)
 
 ```bash
-# Scale each queue independently (3 fetch + 2 parse + 2 summarize = 7 containers)
-docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2
+# Scale each queue independently (3 fetch + 2 parse + 2 enrich + 2 summarize = 9 containers)
+docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale enrichment-worker=2 --scale summarize-worker=2
 
 # Verify workers are running
 docker compose ps
 
 # Monitor all worker logs
-docker compose logs -f fetch-worker parse-worker summarize-worker
+docker compose logs -f workflow-worker url-workflow-worker fetch-worker parse-worker enrichment-worker summarize-worker
 
 # Expected improvement: ~10 min → ~2-3 min for 101 URLs
 ```
@@ -69,10 +69,12 @@ docker compose up postgres temporal -d
 uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 
 # 5. Start Temporal Workers (separate terminals — one per queue)
-QUEUE=workflow python -m src.infrastructure.temporal.run_worker
-QUEUE=fetch    python -m src.infrastructure.temporal.run_worker
-QUEUE=parse    python -m src.infrastructure.temporal.run_worker
-QUEUE=summarize python -m src.infrastructure.temporal.run_worker
+QUEUE=workflow    python -m src.infrastructure.temporal.run_worker
+QUEUE=url-workflow python -m src.infrastructure.temporal.run_worker
+QUEUE=fetch       python -m src.infrastructure.temporal.run_worker
+QUEUE=parse       python -m src.infrastructure.temporal.run_worker
+QUEUE=enrichment  python -m src.infrastructure.temporal.run_worker
+QUEUE=summarize   python -m src.infrastructure.temporal.run_worker
 ```
 
 ### Run tests
@@ -133,27 +135,36 @@ The system is built around **Temporal + asyncio** for concurrency rather than Ce
 ### Concurrency Model
 
 ```
-Parent Workflow (JobWorkflow)
+Parent Workflow (JobWorkflow) — workflow-worker
     │
-    ├── Child Workflow URL1 ──► schedules activities ──► queues
-    ├── Child Workflow URL2 ──► schedules activities ──► queues
-    └── Child Workflow URL3 ──► schedules activities ──► queues
+    ├── Child Workflow URL1 (UrlWorkflow) — url-workflow-worker
+    │     ├── fetch_url ──► fetch-queue ──► fetch-worker
+    │     ├── parse_records ──► parse-queue ──► parse-worker
+    │     ├── EnrichmentWorkflow (child) — enrichment-worker
+    │     │     ├── fetch_article ──► enrichment-queue ──► enrichment-worker
+    │     │     ├── fetch_article ──► enrichment-queue ──► enrichment-worker
+    │     │     └── ... (parallel per article)
+    │     └── summarize_records ──► summarize-queue ──► summarize-worker
+    │
+    ├── Child Workflow URL2 (UrlWorkflow) — url-workflow-worker
+    └── ...
 
-Workers pull from queues:
-    workflow-worker ──► runs all workflows (parent + all children)
-    fetch-worker     ──► polls fetch-queue
-    parse-worker     ──► polls parse-queue
-    summary-worker   ──► polls summary-queue
+Workers:
+    workflow-worker      ── runs JobWorkflow
+    url-workflow-worker  ── runs UrlWorkflow
+    fetch-worker         ── polls fetch-queue
+    parse-worker         ── polls parse-queue
+    enrichment-worker    ── polls enrichment-queue (fetch_article activity + EnrichmentWorkflow)
+    summarize-worker     ── polls summarize-queue
 ```
 
 - **Workflows schedule activities into queues; workers pull from queues.** Workflows never talk to workers directly.
-- **Parent-child split**: `JobWorkflow` spawns one `UrlWorkflow` child per URL. All workflow instances (parent + children) run on the **same** workflow worker. Children are independently visible in Temporal UI with their own retry/timeout.
-- **Each child does not get its own workers** — all children share the same activity workers that poll the same queues
-- **History management**: Parent uses `continue_as_new` every `BATCH_SIZE=10` URLs to reset its event history, avoiding Temporal's 50MB limit. Results are already in the DB, so no accumulator needs to carry over.
+- **Parent-child split**: `JobWorkflow` spawns one `UrlWorkflow` child per URL. `UrlWorkflow` in turn spawns `EnrichmentWorkflow` children for parallel article processing. Each workflow type runs on its own dedicated worker.
+- **UrlWorkflow chains**: fetch → parse → enrichment (child workflow) → summarize
+- **EnrichmentWorkflow** runs parallel `fetch_article` activities (one per record) within a feed
 - **Each queue type runs in its own OS process** — true CPU parallelism; a CPU-bound summarize activity doesn't block fetch or parse
 - **No thread pools** — each process has its own event loop
-- **Scale per queue** — `docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale summarize-worker=2`
-- **Article-level**: within a feed's parse stage, article content fetching runs concurrently via `asyncio.gather` with per-domain `Semaphore(2)` — different domains fully parallel, same domain up to 2 at a time with 1s throttle
+- **Scale per queue** — `docker compose up -d --scale fetch-worker=3 --scale parse-worker=2 --scale enrichment-worker=2 --scale summarize-worker=2`
 - **Per-activity DB sessions** — each activity creates a fresh `AsyncSession` from the factory using `async with` (FastAPI-style) — auto-closes on exit, auto-rollbacks on error
 - **Shared aiohttp session** — long-lived `ClientSession` reused across all activities
 
@@ -193,7 +204,7 @@ Workers pull from queues:
 | Bottleneck                   | Fix                                                                                                    |
 |------------------------------|--------------------------------------------------------------------------------------------------------|
 | 🔌 DB pool                   | Increase `pool_size=100`, PgBouncer, or RDS Proxy                                                      |
-| ⚙️ Worker concurrency        | `docker compose --scale fetch-worker=5 --scale parse-worker=5 --scale summarize-worker=5` |
+| ⚙️ Worker concurrency        | `docker compose --scale fetch-worker=5 --scale parse-worker=5 --scale enrichment-worker=5 --scale summarize-worker=5` |
 | 💻 Summarization CPU         | Offload to process pool or async LLM API (OpenAI, Claude, Ollama)                                      |
 | 🗄️ DB writes                | Batch INSERTs; use COPY for bulk loads                                                                 |
 | 🌐 HTTP connections          | Increase connector limit; keep-alive; DNS cache; HTTP/2 multiplexing                                   |
@@ -205,7 +216,7 @@ Workers pull from queues:
 
 | Current Choice                            | Why                                | What I'd Change                                                                             |
 |-------------------------------------------|------------------------------------|---------------------------------------------------------------------------------------------|
-| 3-stage pipeline (fetch → parse → summarize) | Independent scaling per stage      | **Semaphore-bounded dispatch** per stage if 10K+ URLs                                      |
+| 4-stage pipeline (fetch → parse → enrich → summarize) | Independent scaling per stage      | **Semaphore-bounded dispatch** per stage if 10K+ URLs                                      |
 | Per-process queue workers                 | True CPU parallelism, no GIL       | **Auto-scaling worker pools** based on queue depth                                          |
 | Synchronous summarization in worker       | Each worker has own event loop     | **Process pool** or push to separate async LLM service                                      |
 | `postgresql+asyncpg` per-activity session | Fixes concurrency                  | **SQLAlchemy 2.0 async** + write-through Redis cache                                        |

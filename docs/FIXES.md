@@ -149,3 +149,63 @@ FetchActivity → stores raw_xml in DB → returns task_id → workflow → pass
 **Fix:** Manual intervention — marked the stuck task as failed in the database. Root cause is a Temporal race condition during worker restart.
 
 **Files:** N/A (operational workaround)
+
+---
+
+## 12. Race Condition: Multiple Containers Calling `Base.metadata.create_all()` on Startup
+
+**Issue:** On startup, all 5 containers (`app`, `workflow-worker`, `fetch-worker`, `parse-worker`, `summarize-worker`) simultaneously called `await Base.metadata.create_all()` inside `DatabaseSessionManager.create_tables()`. This is a classic TOCTOU (Time-of-Check to Time-of-Use) race condition: each container's connection checked "do the tables exist?", saw "no", then all tried to create them simultaneously. PostgreSQL's `pg_type_typname_nsp_index` unique constraint caught the duplicate `CREATE TYPE` and raised:
+```
+sqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+DETAIL: Key (typname, typnamespace)=(..., ...) already exists.
+```
+This was **not** a PostgreSQL bug — it was an application-level race from multiple processes trying to create the same schema concurrently.
+
+**Fix:**
+- Deleted all old migrations (0001, 0002, 0003) and created a single baseline migration (`0000_initial_schema.py`) that creates all 4 tables in their final state
+- Added an `init-db` service to `docker-compose.yml` that runs `alembic upgrade head` exactly once, then exits with status 0
+- All worker services depend on `init-db` via `condition: service_completed_successfully`
+- Removed `create_tables()` calls from `main.py` lifespan, `run_worker.py`, and `session.py`
+- Updated `.dockerignore` to include `alembic/versions/` in Docker builds
+- Fixed Dockerfile `COPY` lines so `alembic.ini` lands at `/app/alembic.ini` (not `/app/alembic/alembic.ini`)
+
+**Before:** 5 containers race to `CREATE TABLE IF NOT EXISTS` simultaneously
+**After:** 1 container runs `alembic upgrade head`, all others wait for it to finish
+
+**Files:** `docker-compose.yml` (init-db service), `alembic/versions/0000_initial_schema.py`, `.dockerignore`, `Dockerfile`, `src/main.py`, `src/infrastructure/temporal/run_worker.py`, `src/infrastructure/db/session.py`
+
+---
+
+## 13. Parse Activity Doing Too Much (XML Parsing + Enrichment + S3 Upload in One Activity)
+
+**Issue:** The `parse_records` activity was responsible for: (1) reading XML from S3, (2) parsing with feedparser, (3) fetching full article content for every record via trafilatura, (4) uploading to S3, (5) saving records to DB. For feeds with 10-20 articles, this single activity ran for 30-60+ seconds. Combined with the `CHILD_WORKFLOW_TIMEOUT` of 45 seconds (derived from `ACTIVITY_TIMEOUT=15s × 3 retries × 3 activities = 135s`), activities would be killed before completing, leaving records in an inconsistent state. Additionally, a failure in any one article's enrichment would fail the entire batch.
+
+**Fix:**
+- **Separated parsing from enrichment**: `parse_records` now only parses XML and saves record metadata (title, author, source_link, description). It returns `record_infos` — a list of `{id, source_link}` dicts.
+- **New `EnrichmentActivity.fetch_article`**: Per-record activity that fetches the article URL via trafilatura, uploads content to S3, and updates the record in the DB. Each article is independent with its own error handling.
+- **New `EnrichmentWorkflow`**: Child workflow spawned by `UrlWorkflow` that runs parallel `fetch_article` activities (one per record) via `asyncio.gather`.
+- **Updated `UrlWorkflow`**: Chains: fetch → parse → EnrichmentWorkflow (child) → summarize.
+- **New `enrichment-worker` service**: Polls `xml-feed-enrichment-queue`, handles both `EnrichmentWorkflow` and `fetch_article` activity.
+- **Updated timeouts**: `ACTIVITY_TIMEOUT_SECONDS` default increased from 15 to 60. `CHILD_WORKFLOW_TIMEOUT` derived as `60 × 1 × 3 = 180s`.
+
+**Before:**
+```
+UrlWorkflow:
+  1. fetch_url → fetch-queue
+  2. parse_records → parse-queue  (30-60s: XML + enrichment + S3 + DB)
+  3. summarize_records → summarize-queue
+```
+
+**After:**
+```
+UrlWorkflow:
+  1. fetch_url → fetch-queue          (~2-5s)
+  2. parse_records → parse-queue      (~2-3s: XML parsing + DB metadata only)
+  3. EnrichmentWorkflow (child) → enrichment-queue
+       ├── fetch_article(record_1)    (~2-5s, parallel)
+       ├── fetch_article(record_2)    (~2-5s, parallel)
+       └── ... (one per record)
+  4. summarize_records → summarize-queue  (~2-5s)
+```
+
+**Files:** `src/infrastructure/temporal/activities.py`, `src/infrastructure/temporal/workflows.py`, `src/infrastructure/temporal/worker.py`, `src/infrastructure/temporal/config.py`, `src/infrastructure/repositories/postgres_record_repository.py`, `src/application/interfaces/repositories.py`, `docker-compose.yml`

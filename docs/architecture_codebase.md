@@ -3,40 +3,45 @@
 ## System Overview
 
 ```
-                          ┌─────────────┐
-                          │   FastAPI   │  POST /jobs, GET /jobs/:id
-                          │   (app)     │  GET /jobs/:id/records
-                          └──────┬──────┘
-                                 │ starts workflow
-                          ┌──────▼───────┐
-                          │  Temporal    │
-                          │  Server      │  port 7233
-                          └──┬───┬───┬───┘
-                             │   │   │
-            ┌────────────────┘   │   └────────────────┐
-            ▼                    ▼                     ▼
-   ┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-   │  workflow   │     │  fetch       │     │  parse       │     │ summarize    │
-   │  worker     │     │  worker(s)   │     │  worker(s)   │     │ worker(s)    │
-   │  1 instance │     │  up to 50    │     │  up to 50    │     │ up to 4      │
-   │             │     │  concurrent  │     │  concurrent  │     │ concurrent   │
-   └─────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-        │                    │                      │                     │
-        │  4 separate Temporal task queues          │                     │
-        │  xml-feed-workflow-queue                  │                     │
-        │  xml-feed-fetch-queue                     │                     │
-        │  xml-feed-parse-queue                     │                     │
-        │  xml-feed-summarize-queue                 │                     │
-        │                                           │                     │
-        └──────────────────┬────────────────────────┘─────────────────────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-        ┌──────────┐ ┌──────────┐ ┌──────────┐
-        │PostgreSQL│ │  MinIO   │ │ aiohttp  │
-        │  16      │ │  S3      │ │ (extern) │
-        │ port 5432│ │port 9000 │ │          │
-        └──────────┘ └──────────┘ └──────────┘
+┌─────────────┐
+│   FastAPI   │  POST /jobs, GET /jobs/:id
+│   (app)     │  GET /jobs/:id/records
+└──────┬──────┘
+       │ starts workflow
+┌──────▼───────┐
+│  Temporal    │
+│  Server      │  port 7233
+└──┬───┬───┬───┘
+   │   │   │
+   ├───┘   └──────────────────────────┐
+   ▼            ▼                     ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│workflow  │ │url-      │ │enrichment│
+│worker    │ │workflow  │ │worker(s) │
+│(1)       │ │worker(1) │ │(up to 10)│
+└──────────┘ └──────────┘ └──────────┘
+
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│fetch     │ │parse     │ │summarize │
+│worker(s) │ │worker(s) │ │worker(s) │
+│(up to 50)│ │(up to 50)│ │(cpu_count│
+└──────────┘ └──────────┘ └──────────┘
+
+6 task queues:
+  xml-feed-workflow-queue
+  xml-feed-url-workflow-queue
+  xml-feed-fetch-queue
+  xml-feed-parse-queue
+  xml-feed-enrichment-queue
+  xml-feed-summarize-queue
+
+init-db: runs alembic upgrade head, exits
+
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│PostgreSQL│ │  MinIO   │ │ aiohttp  │
+│  16      │ │  S3      │ │ (extern) │
+│ port 5432│ │port 9000 │ │          │
+└──────────┘ └──────────┘ └──────────┘
 ```
 
 ---
@@ -80,29 +85,35 @@ POST /jobs {"urls": [...101 URLs...]}
                         │
                         │  (per child workflow)
                         ▼
-         ┌─── UrlWorkflow.run() ─────────────────────────────┐
-         │                                                   │
-         │  Activity 1: fetch_url (FETCH_QUEUE)              │
-         │    ↳ aiohttp fetch URL                            │
-         │    ↳ store raw XML in MinIO                       │
-         │    ↳ timeout: 5 min, retry: 3                     │
-         │                                                   │
-         │  Activity 2: parse_records (PARSE_QUEUE)          │
-         │    ↳ retrieve XML from MinIO                      │
-         │    ↳ feedparser.parse() → Records                 │
-         │    ↳ fetch full article content (concurrent)      │
-         │    ↳ gzip + store in MinIO                        │
-         │    ↳ save Records to DB                           │
-         │    ↳ timeout: 5 min, retry: 3                     │
-         │                                                   │
-         │  Activity 3: summarize_records (SUMMARIZE_QUEUE)  │
-         │    ↳ read Records from DB                         │
-         │    ↳ TextRank → TF-IDF → LSA → fallback           │ 
-         │    ↳ save Summaries to DB                         │
-         │    ↳ mark task COMPLETED in DB                    │
-         │    ↳ update job progress in DB                    │
-         │    ↳ timeout: 5 min, retry: 3                     │
-         └───────────────────────────────────────────────────┘
+         ┌─── UrlWorkflow.run() ──────────────────────────────┐
+         │                                                     │
+         │  Activity 1: fetch_url (FETCH_QUEUE)                │
+         │    ↳ aiohttp fetch URL                              │
+         │    ↳ store raw XML in MinIO                         │
+         │    ↳ timeout: 60s, retry: 1                         │
+         │                                                     │
+         │  Activity 2: parse_records (PARSE_QUEUE)            │
+         │    ↳ retrieve XML from MinIO                        │
+         │    ↳ feedparser.parse() → Records (metadata only)   │
+         │    ↳ save Records to DB                             │
+         │    ↳ returns record_infos [{id, source_link}]       │
+         │    ↳ timeout: 60s, retry: 1                         │
+         │                                                     │
+         │  Child Workflow: EnrichmentWorkflow (ENRICHMENT_Q)  │
+         │    ↳ parallel fetch_article per record:             │
+         │      - trafilatura.extract() → content              │
+         │      - gzip + store in MinIO                        │
+         │      - update record.content + s3_key in DB         │
+         │    ↳ timeout: 5 min, retry: 1                       │
+         │                                                     │
+         │  Activity 3: summarize_records (SUMMARIZE_QUEUE)    │
+         │    ↳ read Records from DB                           │
+         │    ↳ TextRank → TF-IDF → LSA → fallback             │ 
+         │    ↳ save Summaries to DB                           │
+         │    ↳ mark task COMPLETED in DB                      │
+         │    ↳ update job progress in DB                      │
+         │    ↳ timeout: 60s, retry: 1                         │
+         └─────────────────────────────────────────────────────┘
                         │
                         ▼
               Job.update_progress(completed, failed)
@@ -135,16 +146,18 @@ POST /jobs {"urls": [...101 URLs...]}
 
 | Timeout | Value | Where Set | Purpose |
 |---------|-------|-----------|---------|
-| `ACTIVITY_TIMEOUT` | **5 min** | `config.py:19` env `ACTIVITY_TIMEOUT_MINUTES` | `start_to_close_timeout` on each Temporal activity (fetch, parse, summarize). If an activity runs longer, Temporal kills it and retries. |
-| `CHILD_WORKFLOW_TIMEOUT` | **3 min** | `config.py:20` env `CHILD_WORKFLOW_TIMEOUT_MINUTES` | `execution_timeout` on each UrlWorkflow child. If a child's 3-activity pipeline runs longer, Temporal kills it. |
-| `BATCH_GATHER_TIMEOUT` | **3 min** | `config.py:21` env `BATCH_GATHER_TIMEOUT_MINUTES` | `asyncio.wait(timeout=...)` on the last batch's gather. If children don't finish in time, pending tasks are cancelled and counted as failed. |
-| aiohttp default | **30s** | `aiohttp_fetcher.py:36` | Total timeout per HTTP fetch request for RSS feeds and article content. |
-| aiohttp YouTube | **10s** | `aiohttp_fetcher.py:46` | Reduced timeout specifically for YouTube RSS feeds (small, fast endpoints). |
-| aiohttp 429 backoff | **5s, 10s, 20s** | `aiohttp_fetcher.py:67` | `5 * (2**attempt)` sleep between rate-limit retries. |
-| aiohttp transient backoff | **1s, 2s** | `aiohttp_fetcher.py:104` | `backoff_base * (2**attempt)` sleep between general retries. |
-| Temporal retry interval | **1s -> 30s** | `config.py:24-25` | `initial_interval=1s`, `maximum_interval=30s`, `backoff_coefficient=2.0` between Temporal activity retries. |
-| DB pool_size | **30** | `session.py:17` | SQLAlchemy persistent connections per engine. |
-| DB max_overflow | **60** | `session.py:17` | Extra connections beyond pool_size when all persistent ones are busy. Total max = 90 per worker. |
+| `ACTIVITY_TIMEOUT` | **60s** | `config.py` env `ACTIVITY_TIMEOUT_SECONDS` | `start_to_close_timeout` on each Temporal activity. If an activity runs longer, Temporal kills it and retries. |
+| `CHILD_WORKFLOW_TIMEOUT` | **180s** (derived) | `config.py` = `ACTIVITY_TIMEOUT × MAX_ACTIVITY_RETRIES × NUM_ACTIVITIES` | `execution_timeout` on each UrlWorkflow child. Derived to guarantee every activity can exhaust all retries before the child is killed. |
+| `ENRICHMENT_CHILD_TIMEOUT` | **5 min** | `workflows.py:125` | `execution_timeout` on EnrichmentWorkflow child. Hardcoded since enrichment has many parallel activities. |
+| `BATCH_GATHER_TIMEOUT` | **15s** | `config.py` env `BATCH_GATHER_TIMEOUT_SECONDS` | `asyncio.wait(timeout=...)` on the last batch's gather. If children don't finish in time, pending tasks are cancelled. |
+| `MAX_ACTIVITY_RETRIES` | **1** | `config.py` env `ACTIVITY_MAX_RETRIES` | Each activity gets only 1 attempt. Combined with 60s timeout = 60s worst-case per activity. |
+| aiohttp default | **30s** | `aiohttp_fetcher.py` | Total timeout per HTTP fetch request for RSS feeds and article content. |
+| aiohttp YouTube | **10s** | `aiohttp_fetcher.py` | Reduced timeout specifically for YouTube RSS feeds. |
+| aiohttp 429 backoff | **5s, 10s, 20s** | `aiohttp_fetcher.py` | `5 * (2**attempt)` seconds between rate-limit retries. |
+| aiohttp transient backoff | **1s, 2s** | `aiohttp_fetcher.py` | `backoff_base * (2**attempt)` seconds between general retries. |
+| Temporal retry interval | **1s → 30s** | `config.py` | `initial_interval=1s`, `maximum_interval=30s`, `backoff_coefficient=2.0`. |
+| DB pool_size | **30** | `session.py` | SQLAlchemy persistent connections per engine. |
+| DB max_overflow | **60** | `session.py` | Extra connections beyond pool_size. Total max = 90 per worker. |
 
 ---
 
@@ -378,15 +391,18 @@ All strategies target `sentences_count=5` (configurable). Source text for summar
 
 | Service | Image | Port(s) | Concurrency |
 |---------|-------|---------|-------------|
+| `init-db` | build . | -- | Runs `alembic upgrade head`, exits |
 | `minio` | `minio/minio:latest` | 9000, 9001 | -- |
 | `postgres` | `postgres:16-alpine` | 5432 | -- |
 | `temporal` | `temporalio/auto-setup:1.23` | 7233 | -- |
 | `temporal-ui` | `temporalio/ui:latest` | 8233 -> 8080 | -- |
-| `app` | build . | 8000 | -- |
-| `workflow-worker` | build . | -- | `JobWorkflow` + `UrlWorkflow` |
+| `app` | build . | 8000 | FastAPI server |
+| `workflow-worker` | build . | -- | Runs `JobWorkflow` |
+| `url-workflow-worker` | build . | -- | Runs `UrlWorkflow` |
 | `fetch-worker` | build . | -- | `max_concurrent_activities`: 50 (docker) / 5 (default) |
 | `parse-worker` | build . | -- | `max_concurrent_activities`: 50 (docker) / 5 (default) |
-| `summarize-worker` | build . | -- | `max_concurrent_activities`: 4 (docker) / cpu_count (default) |
+| `enrichment-worker` | build . | -- | `max_concurrent_activities`: 10 (docker) / 5 (default); also runs `EnrichmentWorkflow` |
+| `summarize-worker` | build . | -- | `max_concurrent_activities`: 10 (docker) / cpu_count (default) |
 
 ---
 
@@ -401,15 +417,18 @@ All strategies target `sentences_count=5` (configurable). Source text for summar
 | `FETCH_QUEUE` | `"xml-feed-fetch-queue"` | `TEMPORAL_FETCH_QUEUE` |
 | `PARSE_QUEUE` | `"xml-feed-parse-queue"` | `TEMPORAL_PARSE_QUEUE` |
 | `SUMMARIZE_QUEUE` | `"xml-feed-summarize-queue"` | `TEMPORAL_SUMMARIZE_QUEUE` |
+| `ENRICHMENT_WORKFLOW_NAME` | `"enrichment-workflow"` | -- |
+| `ENRICHMENT_QUEUE` | `"xml-feed-enrichment-queue"` | `TEMPORAL_ENRICHMENT_QUEUE` |
+| `ENRICHMENT_WORKER_COUNT` | `5` | `ENRICHMENT_WORKERS` |
 | `FETCH_WORKER_COUNT` | `5` | `FETCH_WORKERS` |
 | `PARSE_WORKER_COUNT` | `5` | `PARSE_WORKERS` |
 | `SUMMARIZE_WORKER_COUNT` | `os.cpu_count() or 4` | `SUMMARIZE_WORKERS` |
 | `BATCH_SIZE` | `50` | `WORKFLOW_BATCH_SIZE` |
 | `MAX_CONCURRENT_URLS` | `10` | `MAX_CONCURRENT_URLS` |
-| `ACTIVITY_TIMEOUT` | `5 min` | `ACTIVITY_TIMEOUT_MINUTES` |
-| `CHILD_WORKFLOW_TIMEOUT` | `3 min` | `CHILD_WORKFLOW_TIMEOUT_MINUTES` |
-| `BATCH_GATHER_TIMEOUT` | `3 min` | `BATCH_GATHER_TIMEOUT_MINUTES` |
-| `RETRY_POLICY.maximum_attempts` | `3` | `ACTIVITY_MAX_RETRIES` |
+| `ACTIVITY_TIMEOUT` | `60s` | `ACTIVITY_TIMEOUT_SECONDS` |
+| `CHILD_WORKFLOW_TIMEOUT` | `180s derived` | -- |
+| `BATCH_GATHER_TIMEOUT` | `15s` | `BATCH_GATHER_TIMEOUT_SECONDS` |
+| `MAX_ACTIVITY_RETRIES` | `1` | `ACTIVITY_MAX_RETRIES` |
 | `RETRY_POLICY.initial_interval` | `1s` | -- |
 | `RETRY_POLICY.maximum_interval` | `30s` | -- |
 | `RETRY_POLICY.backoff_coefficient` | `2.0` | -- |
@@ -497,8 +516,8 @@ All strategies target `sentences_count=5` (configurable). Source text for summar
 | `src/infrastructure/fetchers/aiohttp_fetcher.py` | 109 | Async HTTP with retry, backoff, permanent failure detection |
 | `src/infrastructure/storage/s3_storage.py` | 109 | MinIO S3 storage, lazy client init |
 | `src/infrastructure/temporal/config.py` | 27 | All Temporal constants with env var overrides |
-| `src/infrastructure/temporal/workflows.py` | 129 | `JobWorkflow` (batched fire-and-forget), `UrlWorkflow` (3-activity pipeline) |
-| `src/infrastructure/temporal/activities.py` | 253 | `FetchActivity`, `ParseActivity`, `SummarizeActivity` |
+| `src/infrastructure/temporal/workflows.py` | 129 | `JobWorkflow` (batched fire-and-forget), `UrlWorkflow` (fetch → parse → enrichment child → summarize), `EnrichmentWorkflow` (parallel article fetch) |
+| `src/infrastructure/temporal/activities.py` | 253 | `FetchActivity`, `ParseActivity`, `EnrichmentActivity`, `SummarizeActivity` |
 | `src/infrastructure/temporal/worker.py` | 90 | Worker process launcher per queue |
 | `src/infrastructure/temporal/temporal_engine.py` | 43 | Starts workflows on Temporal |
 | `src/infrastructure/temporal/run_worker.py` | 53 | CLI entry point for worker processes |

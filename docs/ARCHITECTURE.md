@@ -8,27 +8,23 @@
 │  (port 8000) │     │  (port 7233) │     │  (port 5432)│
 └──────────────┘     └──────┬───────┘     └─────────────┘
                             │
-                    ┌───────┴────────┐
-                    │ Workflow Worker│
-                    │ (1 process)    │
-                    └───────┬────────┘
-                            │
-          ┌─────────────────┼─────────────────┐
-          │                 │                  │
-  ┌───────▼────────┐ ┌──────▼────────┐ ┌──────▼────────┐
-  │  Fetch Worker  │ │  Parse Worker │ │Summarize Worker│
-  │ (own process)  │ │ (own process) │ │ (own process)  │
-  └───────┬────────┘ └──────┬────────┘ └──────┬────────┘
-          │                 │                  │
-    ┌─────▼───────┐   ┌─────▼───────┐   ┌─────▼───────┐
-    │  aiohttp    │   │  Postgres   │   │  sumy       │
-    │  (fetcher)  │   │  (records)  │   │ (summaries) │
-    └─────┬───────┘   └─────────────┘   └─────────────┘
-          │
-    ┌─────▼───────┐
-    │   External  │
-    │  RSS Feeds  │
-    └─────────────┘
+              ┌─────────────┼──────────────────┐
+              │             │                  │
+    ┌─────────▼──────┐ ┌───▼──────────┐ ┌─────▼────────────┐
+    │ Workflow Worker │ │URL Workflow  │ │ Enrichment Worker│
+    │ (JobWorkflow)   │ │Worker        │ │ (N processes)    │
+    │                 │ │(UrlWorkflow) │ │                  │
+    └─────────┬──────┘ └───┬──────────┘ └─────┬────────────┘
+              │             │                  │
+         ┌────▼─────┐ ┌────▼──────┐ ┌────────▼───────┐
+         │  Fetch   │ │  Parse    │ │  Summarize     │
+         │  Worker  │ │  Worker   │ │  Worker        │
+         └────┬─────┘ └────┬──────┘ └────────┬───────┘
+              │             │                  │
+    ┌─────────▼─────────────▼──────────────────▼─────┐
+    │              init-db (alembic)                  │
+    │         runs migration, then exits              │
+    └─────────────────────────────────────────────────┘
 ```
 
 ## Layer Architecture (Clean Architecture)
@@ -63,7 +59,9 @@ Workflow                          Task Queue              Worker
     │                                 │                       │
     ├── Schedule Activity ─────────► parse-queue ──────────► Parse Worker
     │                                 │                       │
-    └── Schedule Activity ─────────► summary-queue ────────► Summary Worker
+    ├── Start Child Workflow ───────► enrichment-queue ────► Enrichment Worker
+    │                                 │                       │
+    └── Schedule Activity ─────────► summarize-queue ──────► Summary Worker
 ```
 
 **Workflows schedule activities into task queues. Workers pull tasks from those queues and execute them.** A workflow never talks to a worker directly.
@@ -126,28 +124,35 @@ Child URL3 ──► fetch activity ──► fetch-queue ──► Fetch Worker
 ### Real Picture
 
 ```
-Parent Workflow (JobWorkflow)
+Parent Workflow (JobWorkflow) ── workflow-queue ──► Workflow Worker
     │
-    ├── Child Workflow URL1
+    ├── Child Workflow URL1 (UrlWorkflow) ── url-workflow-queue ──► URL Workflow Worker
     │       ├── fetch-queue ──── Fetch Worker
     │       ├── parse-queue ──── Parse Worker
-    │       └── summary-queue ── Summary Worker
+    │       ├── enrichment-queue ── Enrichment Worker (EnrichmentWorkflow)
+    │       │       └── fetch_article activity per record
+    │       └── summarize-queue ── Summary Worker
     │
-    ├── Child Workflow URL2
+    ├── Child Workflow URL2 (UrlWorkflow) ── url-workflow-queue ──► URL Workflow Worker
     │       ├── fetch-queue ──── Fetch Worker
     │       ├── parse-queue ──── Parse Worker
-    │       └── summary-queue ── Summary Worker
+    │       ├── enrichment-queue ── Enrichment Worker (EnrichmentWorkflow)
+    │       └── summarize-queue ── Summary Worker
     │
-    └── Child Workflow URL3
+    └── Child Workflow URL3 (UrlWorkflow) ── url-workflow-queue ──► URL Workflow Worker
             ├── fetch-queue ──── Fetch Worker
             ├── parse-queue ──── Parse Worker
-            └── summary-queue ── Summary Worker
+            ├── enrichment-queue ── Enrichment Worker (EnrichmentWorkflow)
+            └── summarize-queue ── Summary Worker
 
 Shared workers:
-    workflow-worker ── runs all workflows (parent + children)
-    fetch-worker     ── polls fetch-queue for all fetch activities
-    parse-worker     ── polls parse-queue for all parse activities
-    summary-worker   ── polls summary-queue for all summary activities
+    workflow-worker     ── runs JobWorkflow (parent), polls workflow-queue
+    url-workflow-worker ── runs UrlWorkflow (children), polls url-workflow-queue
+    fetch-worker        ── polls fetch-queue for all fetch activities
+    parse-worker        ── polls parse-queue for all parse activities
+    enrichment-worker   ── polls enrichment-queue for fetch_article + EnrichmentWorkflow
+    summary-worker      ── polls summarize-queue for all summary activities
+    init-db             ── runs alembic migrations, then exits
 ```
 
 ### Why This Matters
@@ -187,25 +192,26 @@ Parent Workflow (batch 2 of 10 URLs)  ← fresh history
 - Results are already persisted in the DB by each activity, so no accumulator needs to be passed between executions
 - The last execution returns the final result (only its batch — the API reads full status from the DB)
 
-### Article-Level: Per-Domain Concurrency
+### Article-Level: Per-Domain Concurrency (EnrichmentWorkflow)
 
-Inside a single feed's activity, article content fetching is now concurrent:
+Article content fetching is handled by the **EnrichmentWorkflow** — a child workflow spawned by UrlWorkflow after parsing completes. It runs on the `enrichment-queue` and schedules `fetch_article` activities concurrently:
 
 ```
-_fetch_full_contents(records=[r1, r2, r3, r4, ...])
-  │
-  ├── domain_a: Semaphore(2) ─── r1 (fetch + extract)
-  │   └── domain_a: Semaphore(2) ─── r2 (fetch + extract)
-  │
-  ├── domain_b: Semaphore(2) ─── r3 (fetch + extract)
-  │
-  └── domain_c: Semaphore(2) ─── r4 (fetch + extract)
-       (all domains run concurrently via asyncio.gather)
+UrlWorkflow
+  └── Start EnrichmentWorkflow (child, on enrichment-queue)
+        │
+        ├── fetch_article(record1) ──► enrichment-queue ──► Enrichment Worker
+        ├── fetch_article(record2) ──► enrichment-queue ──► Enrichment Worker
+        ├── fetch_article(record3) ──► enrichment-queue ──► Enrichment Worker
+        └── (all via asyncio.gather)
+              │
+              └── Per-record: fetch + trafilatura extract + store in DB
 ```
 
 - **Different domains**: fully concurrent (no throttling between them)
-- **Same domain**: up to 2 concurrent with 1s gap between start times
+- **Same domain**: up to 2 concurrent with 1s gap between start times (per-domain semaphore)
 - **Config**: `CONCURRENT_PER_DOMAIN = 2`, throttle = 1.0s
+- **Scaling**: EnrichmentWorker processes can be scaled independently (`docker compose --scale enrichment-worker=N`)
 
 ### Activity-Level: Per-Activity DB Sessions (FastAPI-style)
 
@@ -213,16 +219,25 @@ _fetch_full_contents(records=[r1, r2, r3, r4, ...])
 FetchActivity (polled from fetch-queue by fetch-worker)
   └── async with session_factory() as session:
         fetcher.fetch(url) → raw_xml
-        (no DB needed unless error — then task marked failed)
+        store raw_xml in MinIO/S3 (key: feeds/{job_id}/{task_id}.xml)
+        return {"task_id": task_id, "storage_key": storage_key}
 
 ParseActivity (polled from parse-queue by parse-worker)
   └── async with session_factory() as session:
+        read raw_xml from MinIO/S3 using storage_key
         parser.parse(raw_xml) → records
-        fetch_full_contents(records)  ← concurrent per-domain
         record_repo.create_many(records)
         session.commit()
+        return {"task_id": task_id, "record_infos": [...]}
 
-SummarizeActivity (polled from summary-queue by summary-worker)
+EnrichmentActivity (polled from enrichment-queue by enrichment-worker)
+  └── per record: fetch_article activity
+        fetcher.fetch(source_link) → article_html
+        trafilatura.extract(article_html) → full_content
+        record_repo.update_full_content(record_id, full_content)
+        session.commit()
+
+SummarizeActivity (polled from summarize-queue by summarize-worker)
   └── async with session_factory() as session:
         record_repo.list_by_task(task_id) → records
         for each record: generate_summary → save_summary
@@ -235,9 +250,7 @@ Each activity gets a fresh AsyncSession from the pool, managed via
 auto-rollbacks on exception (FastAPI-style lifecycle).
 ```
 
-## Data Flow (Current — Has Anti-Pattern)
-
-⚠️ **Note:** The current flow passes `raw_xml` through Temporal between activities. This works for small feeds but breaks for feeds with large RSS/XML payloads (>4 MB) due to Temporal's gRPC message size limit. See [Payload Size Anti-Pattern](#payload-size-anti-pattern-raw-xml-through-temporal) for details and the fix.
+## Data Flow (Current — Fixed: S3 Storage)
 
 ```
 POST /jobs {"urls": [...]}
@@ -249,84 +262,76 @@ Create Job + Tasks in DB
 Start Temporal Workflow — JobWorkflow (parent, on workflow-worker)
   │
   ▼
-Parent spawns Child Workflows per URL (batched via asyncio.gather)
+Parent spawns Child Workflows per URL (batched via continue_as_new)
   │  All children run on the same workflow-worker
   │
   ▼
-Each UrlWorkflow schedules activities into task queues:
+Each UrlWorkflow (on url-workflow-queue) schedules activities:
   │
   │  UrlWorkflow[task_id]:
   │    │
-  │    ├──► Schedule fetch_url ──► xml-feed-fetch-queue
-  │    │         │
-  │    │         └── Fetch Worker (polls queue) → aiohttp.get(url) → raw_xml
-  │    │                │
-  │    │                ▼
-  │    │         ⚠️ Returns raw_xml in result → stored in Temporal history
-  │    │
-  │    ├──► Schedule parse_records ──► xml-feed-parse-queue
-  │    │         │
-  │    │         │  ⚠️ Receives raw_xml as argument → stored in Temporal history again
-  │    │         │
-  │    │         └── Parse Worker (polls queue)
-  │    │                ├── feedparser.parse(raw_xml) → records
-  │    │                ├── Truncate to max_articles=10
-  │    │                ├── Fetch full article content ← CONCURRENT per-domain
-  │    │                │      (trafilatura, gzip-compress full_content)
-  │    │                └── Store records in DB → session.commit()
-  │    │
-  │    └──► Schedule summarize_records ──► xml-feed-summarize-queue
-  │              │
-  │              └── Summary Worker (polls queue)
-  │                     ├── list records by task_id from DB ← ✅ correct pattern
-  │                     ├── generate summaries (TextRank + TF-IDF + LSA)
-  │                     ├── mark task completed
-  │                     └── update job progress → session.commit()
- ```
- ```
-
-## Data Flow (Fixed — Store Raw XML in MinIO/S3)
-
-```
-POST /jobs {"urls": [...]}
-  │
-  ▼
-Create Job + Tasks in DB
-  │
-  ▼
-Start Temporal Workflow — JobWorkflow (parent, on workflow-worker)
-  │
-  ▼
-Parent spawns Child Workflows per URL (batched via asyncio.gather)
-  │
-  ▼
-Each UrlWorkflow schedules activities into task queues:
-  │
-  │  UrlWorkflow[task_id]:
-  │    │
-  │    ├──► Schedule fetch_url ──► xml-feed-fetch-queue
+  │    ├──► Schedule fetch_url ──► fetch-queue
   │    │         │
   │    │         └── Fetch Worker (polls queue)
   │    │                ├── aiohttp.get(url) → raw_xml
   │    │                ├── ✅ Store raw_xml in MinIO/S3 (key: feeds/{job_id}/{task_id}.xml)
-  │    │                └── ✅ Return only {"task_id": task_id, "storage_key": storage_key}
+  │    │                └── Return {"task_id": task_id, "storage_key": storage_key}
   │    │
-  │    ├──► Schedule parse_records ──► xml-feed-parse-queue
+  │    ├──► Schedule parse_records ──► parse-queue
   │    │         │
   │    │         └── Parse Worker (polls queue)
   │    │                ├── ✅ Read raw_xml from MinIO/S3 using storage_key
   │    │                ├── feedparser.parse(raw_xml) → records
   │    │                ├── Truncate to max_articles=10
-  │    │                ├── Fetch full article content ← CONCURRENT per-domain
-  │    │                └── Store records in DB → session.commit()
+  │    │                ├── Store records in DB → session.commit()
+  │    │                └── Return {"record_infos": [...]}
   │    │
-  │    └──► Schedule summarize_records ──► xml-feed-summarize-queue
+  │    ├──► Start EnrichmentWorkflow (child) ──► enrichment-queue
+  │    │         │
+  │    │         └── Enrichment Worker (polls enrichment-queue)
+  │    │                ├── Schedules fetch_article per record (asyncio.gather)
+  │    │                ├── Each fetch_article: fetch + trafilatura + store full_content
+  │    │                └── Returns {"enriched": N, "failed": M}
+  │    │
+  │    └──► Schedule summarize_records ──► summarize-queue
   │              │
   │              └── Summary Worker (polls queue)
   │                     ├── list records by task_id from DB
   │                     ├── generate summaries (TextRank + TF-IDF + LSA)
   │                     ├── mark task completed
   │                     └── update job progress → session.commit()
+```
+
+## Data Flow (Fixed — 4-Stage Pipeline)
+
+```
+POST /jobs {"urls": [...]}
+  │
+  ▼
+Create Job + Tasks in DB
+  │
+  ▼
+Start Temporal Workflow — JobWorkflow (parent, on workflow-worker)
+  │
+  ▼
+Parent spawns UrlWorkflow children per URL (batched via continue_as_new)
+  │
+  ▼
+Each UrlWorkflow (on url-workflow-queue) runs the 4-stage pipeline:
+  │
+  │  UrlWorkflow[task_id]:
+  │    │
+  │    ├──► Stage 1: fetch_url ──► fetch-queue
+  │    │         └── Fetch Worker → aiohttp.get(url) → store in S3 → return storage_key
+  │    │
+  │    ├──► Stage 2: parse_records ──► parse-queue
+  │    │         └── Parse Worker → read from S3 → feedparser → store records in DB
+  │    │
+  │    ├──► Stage 3: EnrichmentWorkflow (child) ──► enrichment-queue
+  │    │         └── Enrichment Worker → fetch_article per record concurrently
+  │    │
+  │    └──► Stage 4: summarize_records ──► summarize-queue
+  │              └── Summary Worker → generate summaries → mark task completed
 ```
 
 ## Payload Size Anti-Pattern: Raw XML Through Temporal
@@ -447,10 +452,11 @@ Check which activity result or argument is oversized by looking at the size valu
 
 ## Key Decisions
 
-### Why 3 separate queues?
-- **Independent scaling**: fetch (I/O-bound), parse (I/O + CPU), summarize (CPU-bound) each have their own workers and queues, independently scalable via `docker compose --scale`
-- **Isolation**: a fetch backlog doesn't starve summarize workers; each stage can be tuned independently
+### Why 6 separate queues?
+- **Independent scaling**: workflow, url-workflow, fetch (I/O-bound), parse (I/O), enrichment (I/O-bound), summarize (CPU-bound) each have their own workers and queues, independently scalable via `docker compose --scale`
+- **Isolation**: a fetch backlog doesn't starve summarize workers; enrichment runs independently after parsing; each stage can be tuned independently
 - **No thread pools**: each worker process has its own event loop — blocking CPU calls in summarize don't stall fetch or parse
+- **Workflow separation**: JobWorkflow and UrlWorkflow run on separate queues so parent workflow scheduling doesn't compete with child workflow execution
 
 ### Why Temporal?
 - Durable execution with built-in retry + backoff
